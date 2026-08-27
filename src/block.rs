@@ -10,7 +10,7 @@ use core::slice;
 
 use crate::alloc::Allocator;
 use crate::error::{Result, check};
-use crate::io::PosixIo;
+use crate::io::Io;
 use crate::sys;
 use crate::types::TypeRef;
 
@@ -156,30 +156,26 @@ impl Drop for Block {
 
 unsafe impl Send for Block {}
 
-/// Streams successive [`Block`]s off one `chc_io` (a pipe from
-/// `clickhouse local`, a raw block socket). Holds a single buffered reader so
-/// bytes read past a block boundary stay buffered for the next [`read`]; a
-/// fresh reader per block would drop that over-read tail and lose every block
-/// after the first.
+/// Streams successive [`Block`]s off any [`Io`] backend: a pipe from
+/// `clickhouse local`, a raw block socket, an in-memory buffer. Holds a
+/// single buffered reader so bytes read past a block boundary stay buffered
+/// for the next [`read`]; a fresh reader per block would drop that over-read
+/// tail and lose every block after the first.
 ///
 /// [`read`]: BlockReader::read
-pub struct BlockReader<'io, 'fd> {
+pub struct BlockReader<'io, I: Io + ?Sized> {
     raw: NonNull<sys::chc_in>,
-    // Keeps the pinned PosixIo borrowed & fixed: `raw` holds a chc_io pointer
+    // Keeps the pinned backend borrowed & fixed: `raw` holds a chc_io pointer
     // into it for the reader's lifetime.
-    _io: Pin<&'io mut PosixIo<'fd>>,
+    _io: Pin<&'io mut I>,
     alloc: Allocator,
     opts: sys::chc_block_opts,
 }
 
-impl<'io, 'fd> BlockReader<'io, 'fd> {
+impl<'io, I: Io + ?Sized> BlockReader<'io, I> {
     /// Open a reader over `io`. `opts` matches the block frames on the wire
     /// (`BlockOpts::default()` for `clickhouse local`).
-    pub fn new(
-        mut io: Pin<&'io mut PosixIo<'fd>>,
-        alloc: Allocator,
-        opts: BlockOpts,
-    ) -> Result<Self> {
+    pub fn new(mut io: Pin<&'io mut I>, alloc: Allocator, opts: BlockOpts) -> Result<Self> {
         let raw_opts = opts.to_raw();
         let mut raw: *mut sys::chc_in = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
@@ -224,7 +220,7 @@ impl<'io, 'fd> BlockReader<'io, 'fd> {
     }
 }
 
-impl Drop for BlockReader<'_, '_> {
+impl<I: Io + ?Sized> Drop for BlockReader<'_, I> {
     fn drop(&mut self) {
         unsafe { sys::chc_rs_in_destroy(self.raw.as_ptr(), self.alloc.as_ptr()) };
     }

@@ -2,7 +2,7 @@
 //!
 //! Two surfaces:
 //!
-//! * [`TlsIo`] — a [`ClientIo`](crate::ClientIo) backend for the blocking
+//! * [`TlsIo`] — a [`Io`](crate::Io) backend for the blocking
 //!   [`Client`](crate::Client). It owns a rustls [`StreamOwned`] over a
 //!   `std::net::TcpStream` and exposes a `chc_io` vtable whose read/write
 //!   callbacks drive `SSL`-equivalent rustls I/O. The C client never sees
@@ -24,7 +24,7 @@ use std::sync::Arc;
 pub use rustls;
 
 use crate::error::{Error, ErrorKind, Result};
-use crate::io::ClientIo;
+use crate::io::Io;
 use crate::sys;
 
 /// `ClientConfig` trusting the Mozilla webpki root set, no client auth.
@@ -51,7 +51,7 @@ pub fn config_with_roots(roots: rustls::RootCertStore) -> Arc<rustls::ClientConf
 
 type RustlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
-/// Blocking TLS [`ClientIo`] backend: rustls over an owned `TcpStream`.
+/// Blocking TLS [`Io`] backend: rustls over an owned `TcpStream`.
 ///
 /// Self-referential — the `chc_io` vtable's `ud` points back at the
 /// `TlsIo` so the C client's read/write calls land on `stream`. Hence the
@@ -112,7 +112,7 @@ impl TlsIo {
 // `ud` back-points at the same node (fixed address under Pin) and
 // tls_read/tls_write honor the vtable contract. Valid until the retaining
 // Client drops, which then drops this backend.
-unsafe impl ClientIo for TlsIo {
+unsafe impl Io for TlsIo {
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
         // SAFETY: hands back the address of a field; does not move `self`.
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }

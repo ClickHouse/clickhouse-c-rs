@@ -2,154 +2,13 @@
 //!
 //! Skips when `clickhouse` is not on PATH.
 
-use std::io;
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
 
 use clickhouse_c::{AsyncClient, Block, BlockBuilder, ClientOpts, ColumnBuilder, Event, TypeAst};
-
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-fn clickhouse_on_path() -> bool {
-    Command::new("clickhouse")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-struct ChServer {
-    child: Child,
-    port: u16,
-    _tmp: tempfile::TempDir,
-}
-
-impl ChServer {
-    async fn spawn() -> TestResult<Self> {
-        let tmp = tempfile::tempdir()?;
-        let data_dir = tmp.path().join("ch");
-        let log_dir = tmp.path().join("ch-logs");
-        std::fs::create_dir_all(&data_dir)?;
-        std::fs::create_dir_all(&log_dir)?;
-
-        let (tcp_port, http_port, interserver_port) = pick_ports()?;
-        let mut cmd = Command::new("clickhouse");
-        cmd.args([
-            "server",
-            "--",
-            &format!("--tcp_port={tcp_port}"),
-            &format!("--http_port={http_port}"),
-            &format!("--interserver_http_port={interserver_port}"),
-            "--mysql_port=",
-            "--postgresql_port=",
-            "--grpc_port=",
-            "--prometheus.port=",
-            "--listen_host=127.0.0.1",
-            &format!("--path={}/", data_dir.display()),
-            &format!("--logger.log={}/server.log", log_dir.display()),
-            &format!("--logger.errorlog={}/error.log", log_dir.display()),
-            "--logger.level=warning",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        let child = cmd.spawn()?;
-
-        let server = Self {
-            child,
-            port: tcp_port,
-            _tmp: tmp,
-        };
-        server.wait_for_ready().await?;
-        Ok(server)
-    }
-
-    async fn wait_for_ready(&self) -> TestResult {
-        let start = Instant::now();
-        let addr = format!("127.0.0.1:{}", self.port);
-        while start.elapsed() < Duration::from_secs(60) {
-            if TcpStream::connect_timeout(&addr.parse()?, Duration::from_millis(200)).is_ok()
-                && self.query("SELECT 1").is_ok()
-            {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        Err(io::Error::other("clickhouse server did not become ready").into())
-    }
-
-    fn query(&self, sql: &str) -> TestResult<String> {
-        let out = Command::new("clickhouse")
-            .args([
-                "client",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &self.port.to_string(),
-                "--query",
-                sql,
-            ])
-            .output()?;
-        if !out.status.success() {
-            return Err(io::Error::other(format!(
-                "clickhouse query failed: {sql}, stderr={}",
-                String::from_utf8_lossy(&out.stderr)
-            ))
-            .into());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-}
-
-impl Drop for ChServer {
-    fn drop(&mut self) {
-        let _ = self.query("SYSTEM SHUTDOWN");
-        for _ in 0..50 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(_) => break,
-            }
-        }
-        #[cfg(unix)]
-        {
-            let pgid = self.child.id() as i32;
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{pgid}")])
-                .stderr(Stdio::null())
-                .status();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-    }
-}
-
-fn pick_ports() -> io::Result<(u16, u16, u16)> {
-    let tcp = TcpListener::bind(("127.0.0.1", 0))?;
-    let http = TcpListener::bind(("127.0.0.1", 0))?;
-    let interserver = TcpListener::bind(("127.0.0.1", 0))?;
-    let ports = (
-        tcp.local_addr()?.port(),
-        http.local_addr()?.port(),
-        interserver.local_addr()?.port(),
-    );
-    drop((tcp, http, interserver));
-    Ok(ports)
-}
+use common::{ChServer, TestResult, clickhouse_on_path};
 
 async fn connect(server: &ChServer) -> clickhouse_c::Result<AsyncClient> {
-    AsyncClient::connect(("127.0.0.1", server.port), ClientOpts::new(), None).await
+    AsyncClient::connect(("127.0.0.1", server.tcp_port), ClientOpts::new(), None).await
 }
 
 async fn drain(client: &mut AsyncClient) -> TestResult {
@@ -169,7 +28,7 @@ async fn async_insert_select_roundtrip() -> TestResult {
         return Ok(());
     }
 
-    let server = ChServer::spawn().await?;
+    let server = ChServer::spawn()?;
     let mut client = connect(&server).await?;
     assert!(client.server_info().is_some());
 
@@ -232,7 +91,7 @@ async fn async_bad_sql_returns_exception() -> TestResult {
         return Ok(());
     }
 
-    let server = ChServer::spawn().await?;
+    let server = ChServer::spawn()?;
     let mut client = connect(&server).await?;
     client
         .send_query("SELECT * FROM definitely_missing_async_table", None)

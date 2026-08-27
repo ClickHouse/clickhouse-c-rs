@@ -1,16 +1,20 @@
 //! Compression codec handles.
 //!
-//! Built-in helpers for LZ4 (feature `lz4`, default) and ZSTD (feature
-//! `zstd`) populate a [`Codec`] that the client passes to the server.
-//! Manual codecs can be assembled by filling [`Codec::raw_mut`] directly.
+//! [`Codec::lz4`] and [`Codec::zstd`] populate a [`Codec`] from
+//! clickhouse-compression.h's adapters, each behind its own feature.
+//! [`Codec::empty`] plus [`Codec::raw_mut`], or [`Codec::from_raw`], build one
+//! from caller-supplied callbacks and stay available with no features at
+//! all -- linking a compression library is a choice, not a prerequisite for
+//! having a codec.
 
 use core::pin::Pin;
 
 use crate::sys;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Compression {
+    #[default]
     None = sys::CHC_COMP_NONE,
     Lz4 = sys::CHC_COMP_LZ4,
     Zstd = sys::CHC_COMP_ZSTD,
@@ -27,9 +31,15 @@ pub struct Codec {
 }
 
 impl Codec {
-    #[cfg(any(feature = "lz4", feature = "zstd"))]
-    fn zeroed() -> Self {
-        Self {
+    /// A codec with no callbacks installed.
+    ///
+    /// Only usable with [`Compression::None`] until [`raw_mut`] fills the
+    /// slots a codec needs; [`Client::init`](crate::Client::init) rejects the
+    /// mismatch rather than reaching a null call.
+    ///
+    /// [`raw_mut`]: Codec::raw_mut
+    pub fn empty() -> Pin<Box<Self>> {
+        Box::pin(Self {
             raw: sys::chc_codec {
                 ud: core::ptr::null_mut(),
                 lz4_compress: None,
@@ -40,12 +50,28 @@ impl Codec {
                 zstd_bound: None,
             },
             _pin: core::marker::PhantomPinned,
-        }
+        })
+    }
+
+    /// Take a fully filled `chc_codec`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`raw_mut`](Codec::raw_mut): every installed function
+    /// pointer must match its field's signature, the slots required by the
+    /// [`Compression`] this codec is paired with must all be set, and any
+    /// `ud` must outlive the [`Codec`] and be dereferenceable from every
+    /// thread the codec is used from.
+    pub unsafe fn from_raw(raw: sys::chc_codec) -> Pin<Box<Self>> {
+        Box::pin(Self {
+            raw,
+            _pin: core::marker::PhantomPinned,
+        })
     }
 
     #[cfg(feature = "lz4")]
     pub fn lz4() -> Pin<Box<Self>> {
-        let mut b = Box::pin(Self::zeroed());
+        let mut b = Self::empty();
         unsafe {
             let this = b.as_mut().get_unchecked_mut();
             sys::chc_lz4_codec_init(&mut this.raw);
@@ -55,7 +81,7 @@ impl Codec {
 
     #[cfg(feature = "zstd")]
     pub fn zstd() -> Pin<Box<Self>> {
-        let mut b = Box::pin(Self::zeroed());
+        let mut b = Self::empty();
         unsafe {
             let this = b.as_mut().get_unchecked_mut();
             sys::chc_zstd_codec_init(&mut this.raw);
@@ -90,14 +116,21 @@ impl Codec {
         &self.raw
     }
 
+    /// Whether every slot `compression` reaches is filled. The bound
+    /// callback sizes the compressed frame before compressing, so leaving it
+    /// out is as fatal as leaving out the compressor.
     pub(crate) fn supports(self: Pin<&Self>, compression: Compression) -> bool {
         match compression {
             Compression::None => true,
             Compression::Lz4 => {
-                self.raw.lz4_compress.is_some() && self.raw.lz4_decompress.is_some()
+                self.raw.lz4_compress.is_some()
+                    && self.raw.lz4_decompress.is_some()
+                    && self.raw.lz4_bound.is_some()
             }
             Compression::Zstd => {
-                self.raw.zstd_compress.is_some() && self.raw.zstd_decompress.is_some()
+                self.raw.zstd_compress.is_some()
+                    && self.raw.zstd_decompress.is_some()
+                    && self.raw.zstd_bound.is_some()
             }
         }
     }
@@ -114,4 +147,76 @@ pub fn cityhash128(data: &[u8]) -> (u64, u64) {
         sys::chc_cityhash128(data.as_ptr().cast(), data.len(), &mut lo, &mut hi);
     }
     (lo, hi)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ffi::{c_int, c_void};
+
+    use super::{Codec, Compression};
+    use crate::sys;
+
+    #[test]
+    fn empty_codec_supports_only_uncompressed() {
+        let codec = Codec::empty();
+        assert!(codec.as_ref().supports(Compression::None));
+        assert!(!codec.as_ref().supports(Compression::Lz4));
+        assert!(!codec.as_ref().supports(Compression::Zstd));
+    }
+
+    // A compressor with no bound callback would reach a null call while
+    // sizing the frame, so it must not count as support.
+    #[test]
+    fn missing_bound_callback_is_not_support() {
+        let mut codec = Codec::empty();
+        unsafe {
+            let raw = codec.as_mut().raw_mut();
+            raw.lz4_compress = Some(stub_compress);
+            raw.lz4_decompress = Some(stub_decompress);
+        }
+        assert!(!codec.as_ref().supports(Compression::Lz4));
+
+        unsafe { codec.as_mut().raw_mut().lz4_bound = Some(stub_bound) };
+        assert!(codec.as_ref().supports(Compression::Lz4));
+    }
+
+    // Never called: `supports` only inspects which slots are filled.
+    unsafe extern "C" fn stub_compress(
+        _ud: *mut c_void,
+        _src: *const c_void,
+        _src_len: usize,
+        _dst: *mut c_void,
+        _dst_cap: usize,
+        _dst_n: *mut usize,
+        _err: *mut sys::chc_err,
+    ) -> c_int {
+        sys::CHC_OK
+    }
+
+    unsafe extern "C" fn stub_decompress(
+        _ud: *mut c_void,
+        _src: *const c_void,
+        _src_len: usize,
+        _dst: *mut c_void,
+        _original_size: usize,
+        _err: *mut sys::chc_err,
+    ) -> c_int {
+        sys::CHC_OK
+    }
+
+    unsafe extern "C" fn stub_bound(src_len: usize) -> usize {
+        src_len
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn built_in_lz4_fills_every_slot() {
+        assert!(Codec::lz4().as_ref().supports(Compression::Lz4));
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn built_in_zstd_fills_every_slot() {
+        assert!(Codec::zstd().as_ref().supports(Compression::Zstd));
+    }
 }

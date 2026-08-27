@@ -16,35 +16,50 @@
 //! Covers TCP sockets (production) and pipes (the `clickhouse local` test
 //! path) without further plumbing.
 
+use core::ffi::c_void;
 use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::sys;
 
-/// I/O backend a [`Client`](crate::Client) talks through. Hands the C
-/// client the `chc_io` vtable pointer it retains for the connection's
-/// lifetime; the implementor keeps that vtable at a fixed address (hence
-/// the `Pin<&mut Self>` receiver) until the client drops.
+/// Byte transport clickhouse-c reads and writes through.
+///
+/// Hands out the `chc_io` vtable pointer C retains for the duration of the
+/// operation; the implementor keeps that vtable at a fixed address, hence the
+/// `Pin<&mut Self>` receiver. Used by [`Client`](crate::Client),
+/// [`BlockReader`](crate::BlockReader), and
+/// [`BlockBuilder::write`](crate::BlockBuilder::write) alike, so a backend
+/// written once serves every path.
 ///
 /// Implemented by [`PosixIo`] (plaintext fd) and, under feature `tls`, by
-/// `tls::TlsIo` (rustls over a `TcpStream`). A custom backend (eg OpenSSL
-/// via `clickhouse-openssl.h`) may implement it too — hence `unsafe`:
-/// [`Client::init`](crate::Client::init) passes `io_ptr`'s return straight
-/// to C without validating it.
+/// `tls::TlsIo` (rustls over a `TcpStream`). A custom backend -- OpenSSL via
+/// `clickhouse-openssl.h`, an in-memory buffer, a caller's own event loop --
+/// may implement it too, hence `unsafe`: the crate passes `io_ptr`'s return
+/// straight to C without validating it.
 ///
 /// # Safety
 ///
 /// `io_ptr` must return a non-null pointer to a fully initialized `chc_io`
 /// whose `read` / `write` (and `check_cancel`, if set) callbacks honor the
-/// clickhouse-c vtable contract. That pointer, and any state it
-/// back-references, must stay valid and fixed in place for as long as the
-/// pinned `self` lives — through the whole lifetime of the `Client` that
-/// retains it. C dereferences it and calls through it on whatever thread
-/// owns the `Client`.
-pub unsafe trait ClientIo {
+/// clickhouse-c vtable contract:
+///
+/// * `read` fills up to `len` bytes, stores the count in `out_n`, and
+///   returns `CHC_OK`. `out_n == 0` means clean EOF.
+/// * `write` writes all `len` bytes or fails.
+/// * Both report failure by filling `*err` and returning a `CHC_ERR_*` code.
+///
+/// That pointer, and any state it back-references, must stay valid and fixed
+/// in place for as long as the pinned `self` lives -- through the whole
+/// lifetime of whatever retains it, which for a
+/// [`Client`](crate::Client) is the entire connection. C dereferences it and
+/// calls through it on whatever thread drives the operation, never
+/// concurrently from two.
+pub unsafe trait Io {
     /// Pointer to the `chc_io` vtable, valid while `self` is pinned alive.
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io;
 
@@ -58,6 +73,52 @@ pub unsafe trait ClientIo {
     }
 }
 
+/// Cooperative cancellation flag for a [`PosixIo`].
+///
+/// Cloneable and shareable across threads: hand one clone to
+/// [`PosixIo::new_cancellable`] and keep another to [`cancel`] with.
+///
+/// # What it does and does not interrupt
+///
+/// clickhouse-c checks the flag *before* each transport read, not during
+/// one, so a read already parked in `read(2)` runs to completion. Pair the
+/// token with [`PosixIo::set_read_timeout`] to bound that wait, and the
+/// cancel is observed on the next attempt. Once set, reads fail with
+/// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled).
+///
+/// This is local: it stops *this* side reading. It sends nothing, so the
+/// server keeps producing. To ask the server to stop, send the protocol
+/// Cancel packet with [`Client::send_cancel`](crate::Client::send_cancel)
+/// and drain to `EndOfStream`.
+///
+/// [`cancel`]: CancelToken::cancel
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail every later read on the [`PosixIo`] holding a clone of this
+    /// token. One-way: there is no reset, because a half-consumed block
+    /// leaves the stream unparseable anyway.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Reads the flag `cancel_ud` points at. clickhouse-c calls this from
+/// whatever thread drives the read.
+unsafe extern "C" fn check_cancel_flag(ud: *mut c_void) -> bool {
+    // SAFETY: ud is the AtomicBool inside the Arc the PosixIo keeps alive.
+    unsafe { &*ud.cast::<AtomicBool>() }.load(Ordering::Relaxed)
+}
+
 pub struct PosixIo<'fd> {
     state: sys::chc_posix_io,
     io: sys::chc_io,
@@ -68,6 +129,10 @@ pub struct PosixIo<'fd> {
     /// lifetime.
     #[allow(dead_code)]
     owned: Option<OwnedFd>,
+    /// Keeps the flag `state.cancel_ud` points at alive for as long as C can
+    /// call through it.
+    #[allow(dead_code)]
+    cancel: Option<CancelToken>,
     _fd: PhantomData<BorrowedFd<'fd>>,
     // io.ud back-points at `state`; the node must not move once wired.
     _pin: PhantomPinned,
@@ -80,10 +145,16 @@ impl<'fd> PosixIo<'fd> {
     /// kernel level (subsequent reads land in whatever the fd table
     /// reassigned the number to).
     pub fn new(fd: BorrowedFd<'fd>) -> Pin<Box<Self>> {
-        Self::build(fd.as_raw_fd(), None)
+        Self::build(fd.as_raw_fd(), None, None)
     }
 
-    fn build(fd: RawFd, owned: Option<OwnedFd>) -> Pin<Box<Self>> {
+    /// Wrap a borrowed fd whose reads a [`CancelToken`] can abort. See the
+    /// token's docs for what it interrupts.
+    pub fn new_cancellable(fd: BorrowedFd<'fd>, cancel: CancelToken) -> Pin<Box<Self>> {
+        Self::build(fd.as_raw_fd(), None, Some(cancel))
+    }
+
+    fn build(fd: RawFd, owned: Option<OwnedFd>, cancel: Option<CancelToken>) -> Pin<Box<Self>> {
         let mut boxed = Box::pin(Self {
             // Overwritten wholesale by chc_posix_io_init below; pre-filled
             // only to satisfy Rust's all-fields-init rule.
@@ -100,6 +171,7 @@ impl<'fd> PosixIo<'fd> {
                 check_cancel: None,
             },
             owned,
+            cancel,
             _fd: PhantomData,
             _pin: PhantomPinned,
         });
@@ -108,22 +180,18 @@ impl<'fd> PosixIo<'fd> {
         // SAFETY: only writes fields; never moves out of the pin.
         unsafe {
             let this = boxed.as_mut().get_unchecked_mut();
-            sys::chc_posix_io_init(
-                &mut this.state,
-                &mut this.io,
-                fd,
-                None,
-                core::ptr::null_mut(),
-            );
+            // Point at the AtomicBool inside the Arc this node now owns, not
+            // at the CancelToken wrapper, which moves with the struct.
+            let (check, ud) = match &this.cancel {
+                Some(token) => (
+                    Some(check_cancel_flag as unsafe extern "C" fn(*mut c_void) -> bool),
+                    Arc::as_ptr(&token.0).cast_mut().cast::<c_void>(),
+                ),
+                None => (None, core::ptr::null_mut()),
+            };
+            sys::chc_posix_io_init(&mut this.state, &mut this.io, fd, check, ud);
         }
         boxed
-    }
-
-    #[inline]
-    pub(crate) fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
-        // Hand back the address of the inline vtable the client retains for
-        // its lifetime. SAFETY: returns a field pointer; does not move self.
-        unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
 
     /// Bound subsequent blocking reads by an absolute `now + timeout`
@@ -156,7 +224,14 @@ impl PosixIo<'static> {
     pub fn new_owned<F: Into<OwnedFd>>(fd: F) -> Pin<Box<Self>> {
         let fd = fd.into();
         let raw = fd.as_fd().as_raw_fd();
-        Self::build(raw, Some(fd))
+        Self::build(raw, Some(fd), None)
+    }
+
+    /// Take ownership of the fd and make its reads cancellable.
+    pub fn new_owned_cancellable<F: Into<OwnedFd>>(fd: F, cancel: CancelToken) -> Pin<Box<Self>> {
+        let fd = fd.into();
+        let raw = fd.as_fd().as_raw_fd();
+        Self::build(raw, Some(fd), Some(cancel))
     }
 }
 
@@ -164,11 +239,11 @@ impl PosixIo<'static> {
 // clickhouse-c's posix read/write callbacks by chc_posix_io_init; its `ud`
 // back-points at the inline `state`, which stays at a fixed address behind
 // the pinned Box for as long as the retaining Client lives.
-unsafe impl<'fd> ClientIo for PosixIo<'fd> {
+unsafe impl<'fd> Io for PosixIo<'fd> {
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
-        // Inherent method wins path resolution over this trait method, so
-        // no recursion; block.rs / builder.rs still call it directly.
-        Self::io_ptr(self)
+        // Address of the inline vtable the caller retains. SAFETY: returns a
+        // field pointer; does not move self.
+        unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
 
     fn set_read_timeout(self: Pin<&mut Self>, timeout: Option<Duration>) -> Result<()> {

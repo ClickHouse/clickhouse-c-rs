@@ -3,11 +3,11 @@
 //!
 //! Two entry points:
 //!
-//! * [`PosixIo`] over a pipe or socket fd, plus [`Block`] /
-//!   [`BlockBuilder`]: read or write Native blocks without going through
-//!   the TCP packet loop. Suitable for piping into
-//!   `clickhouse local --format Native` or for talking to any peer that
-//!   speaks raw block frames.
+//! * [`BlockReader`] / [`BlockBuilder`] over any [`Io`] backend: read or
+//!   write Native blocks without going through the TCP packet loop.
+//!   [`PosixIo`] covers a pipe or socket fd, which is enough to pipe
+//!   `clickhouse local --format Native`; implement [`Io`] for anything
+//!   else.
 //! * [`Client`] over a connected TCP [`PosixIo`]: full Hello / Query /
 //!   Data / EOS / Exception / Progress packet loop with optional LZ4 /
 //!   ZSTD compression.
@@ -44,6 +44,7 @@ mod error;
 mod io;
 #[cfg(test)]
 mod parity;
+mod query;
 #[cfg(feature = "tls")]
 pub mod tls;
 mod types;
@@ -58,5 +59,6 @@ pub use client::{
 };
 pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};
-pub use io::{ClientIo, PosixIo};
+pub use io::{CancelToken, Io, PosixIo};
+pub use query::{QueryOpts, QueryParam, QuerySetting};
 pub use types::{Kind, TypeAst, TypeRef};

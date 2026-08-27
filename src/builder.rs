@@ -13,7 +13,7 @@ use core::pin::Pin;
 
 use crate::block::BlockOpts;
 use crate::error::{Error, ErrorKind, Result, check};
-use crate::io::PosixIo;
+use crate::io::Io;
 use crate::sys;
 use crate::types::TypeRef;
 
@@ -225,11 +225,12 @@ impl<'a> BlockBuilder<'a> {
         Ok(())
     }
 
-    /// Serialize through an `Io`. `opts` matches what [`BlockReader`]
-    /// uses; clickhouse-local accepts the default (all-zeros).
+    /// Serialize through any [`Io`] backend. `opts` matches what
+    /// [`BlockReader`] uses; `clickhouse local` accepts the default
+    /// (all-zeros).
     ///
     /// [`BlockReader`]: crate::BlockReader
-    pub fn write(&self, io: Pin<&mut PosixIo<'_>>, opts: BlockOpts) -> Result<()> {
+    pub fn write<I: Io + ?Sized>(&self, io: Pin<&mut I>, opts: BlockOpts) -> Result<()> {
         let raw_opts = opts.to_raw();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_block_write(io.io_ptr(), &self.raw, &raw_opts, &mut err) };

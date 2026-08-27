@@ -145,11 +145,11 @@ impl AsyncClient {
         // `Send`, which `tokio::spawn` / a multi-thread runtime require.
         let raw = {
             let codec_ptr = codec.as_ref().map(|c| c.as_ref().as_ptr());
-            let raw_opts = opts.to_raw(codec_ptr);
+            let raw_opts = opts.to_raw(codec_ptr)?;
             let mut out: *mut sys::chc_async_client = core::ptr::null_mut();
             let mut err = sys::chc_err::zeroed();
             let rc = unsafe {
-                sys::chc_async_client_init(&mut out, &raw_opts, alloc.as_ptr(), &mut err)
+                sys::chc_async_client_init(&mut out, raw_opts.as_ptr(), alloc.as_ptr(), &mut err)
             };
             check(rc, &err)?;
             NonNull::new(out).expect("chc_async_client_init returned OK with NULL")
@@ -165,6 +165,14 @@ impl AsyncClient {
         Ok(client)
     }
 
+    /// Send a query.
+    ///
+    /// clickhouse-c publishes no `chc_async_send_query_ex`, so the async
+    /// client has no counterpart to
+    /// [`Client::send_query_with`](crate::Client::send_query_with): per-query
+    /// settings and parameters are reachable from the blocking client only.
+    /// Until upstream adds one, put required settings in the SQL text or on
+    /// the server profile.
     pub async fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
         self.drain_out().await?;
         // Scope raw FFI args so no raw pointer is held across the drain

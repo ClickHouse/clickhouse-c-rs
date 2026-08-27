@@ -3,7 +3,8 @@
 Rust bindings for [clickhouse-c], a header-only C client for the
 ClickHouse Native wire format. Two entry points:
 
-- raw block frames over any fd (TCP socket, pipe to `clickhouse local`)
+- raw block frames over any transport implementing the `Io` trait
+  (`PosixIo` covers a TCP socket or a pipe to `clickhouse local`)
 - TCP packet loop (Hello / Query / Data / EOS / Exception / Progress)
   with optional LZ4 / ZSTD compression
 - Tokio async TCP packet loop with feature `tokio`
@@ -43,7 +44,7 @@ need its development package (`liblz4-dev` / `libzstd-dev` on Debian,
    error codes) & a couple of `#define`s are scanned out of the
    headers by `build.rs` into `$OUT_DIR/sys_constants.rs` & pulled in
    via `include!`.
-4. **Safe wrappers** in `src/{error,alloc,io,types,block,builder,codec,client}.rs`.
+4. **Safe wrappers** in `src/{error,alloc,io,types,block,builder,codec,client,query}.rs`.
    Each owning C struct gets a Drop impl that calls the matching
    `chc_*_destroy` / `_close` / `_free`. Borrowed views ride lifetimes
    tied to their owner.
@@ -93,6 +94,14 @@ through `Pin<&mut _>` / `Pin<&_>`: `PosixIo` for ownership-passing into
 move. `Codec::raw_mut` is `unsafe`: caller must
 populate the function-pointer table to match the [`Compression`] the
 codec is paired with.
+
+**One `Io` trait for every path.** `Client`, `BlockReader`, and
+`BlockBuilder::write` all take a `Pin<&mut impl Io>`, so a backend written
+once serves all three. `PosixIo` and `tls::TlsIo` ship with the crate; a
+consumer can add OpenSSL through `clickhouse-openssl.h`, an in-memory
+buffer, or their own event loop by implementing the trait. It is `unsafe`
+because `io_ptr`'s return goes straight to C: see `tests/custom_io.rs` for
+a worked backend.
 
 **`Client` owns its I/O + codec.** `chc_client` stashes raw pointers
 to `chc_io` & `chc_codec` for the connection's lifetime; using
@@ -240,6 +249,49 @@ loop {
 }
 ```
 
+### Per-query settings & parameters
+
+`send_query_with` carries a `SETTINGS` list and `{name:Type}` parameters.
+Pin `QuerySetting::TEXT_TYPE_NAMES` on every query: the decoder reads
+printable type names off the wire, and a server profile that switches
+them to binary would otherwise break decoding.
+
+Parameter values are single-quoted whatever the placeholder type — the
+server unquotes, then parses the text as `Type`.
+
+```rust,ignore
+use clickhouse_c::{QueryOpts, QueryParam, QuerySetting};
+
+let settings = [
+    QuerySetting::TEXT_TYPE_NAMES,
+    QuerySetting::new("max_block_size", "8192"),
+    // `important` makes the server reject a setting it does not know
+    // instead of ignoring it.
+    QuerySetting::new("max_execution_time", "30").important(),
+];
+let params = [QueryParam::new("cutoff", "'100'")];
+
+client.send_query_with(
+    "SELECT number FROM numbers(1000) WHERE number > {cutoff:UInt64}",
+    &QueryOpts::new().settings(&settings).params(&params),
+)?;
+```
+
+clickhouse-c publishes no `chc_async_send_query_ex`, so `AsyncClient` has
+no counterpart yet.
+
+### Cancellation
+
+Two separate things, often wanted together:
+
+- `CancelToken` fails local reads. Hand a clone to
+  `PosixIo::new_cancellable`; clickhouse-c checks it before each transport
+  read, so pair it with `set_read_timeout` to bound a read already parked
+  in `read(2)`. Nothing goes over the wire.
+- `Client::send_cancel` sends the protocol Cancel packet so the server
+  stops producing. Packets already in flight still arrive, so keep
+  draining to `EndOfStream`.
+
 ### TLS (feature `tls`)
 
 rustls verifies the peer against `tls::default_config()` (Mozilla webpki
@@ -262,7 +314,7 @@ let mut client = AsyncClient::connect_tls(
 ).await?;
 ```
 
-Blocking — `tls::TlsIo` is a `ClientIo` backend over an owned `TcpStream`;
+Blocking — `tls::TlsIo` is a `Io` backend over an owned `TcpStream`;
 hand it to the same `Client::init` the plaintext path uses:
 
 ```rust,ignore

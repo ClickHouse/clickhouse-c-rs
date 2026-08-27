@@ -8,38 +8,42 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 use core::slice;
 use core::time::Duration;
+use std::ffi::CString;
 
 use crate::alloc::Allocator;
 use crate::block::Block;
 use crate::builder::BlockBuilder;
 use crate::codec::{Codec, Compression};
 use crate::error::{Error, ErrorKind, Result, check};
-use crate::io::ClientIo;
+use crate::io::Io;
+use crate::query::{QueryOpts, RawQueryOpts, cstring};
 use crate::sys;
 
-/// Connection settings. NUL-terminated `CString`-style buffers held
-/// inline so the C side's borrowed pointers stay valid through
-/// [`Client::init`].
+/// Connection settings, sent in the Hello handshake.
+///
+/// The string fields are copied and NUL-terminated when the client
+/// connects; an interior NUL is reported as
+/// [`ErrorKind::Usage`](crate::ErrorKind::Usage) instead of silently
+/// truncating what the server sees.
+#[derive(Clone, Debug, Default)]
 pub struct ClientOpts {
-    client_name: Option<Vec<u8>>,
-    database: Option<Vec<u8>>,
-    user: Option<Vec<u8>>,
-    password: Option<Vec<u8>>,
+    client_name: Option<String>,
+    database: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    /// Client version reported to the server. Cosmetic: it shows up in
+    /// `system.query_log`. Defaults to 0.0.0.
+    pub client_version_major: u64,
+    pub client_version_minor: u64,
+    pub client_version_patch: u64,
+    /// Native protocol revision to negotiate. 0 keeps clickhouse-c's own
+    /// default, [`sys::CHC_CLIENT_DEFAULT_REVISION`]. The server caps the
+    /// negotiated revision at its own, so asking for a newer one is safe;
+    /// asking for an older one turns off the features it gates.
+    pub client_revision: u64,
     pub compression: Compression,
+    /// Internal read buffer. 0 selects clickhouse-c's 8 KiB default.
     pub read_buffer_bytes: usize,
-}
-
-impl Default for ClientOpts {
-    fn default() -> Self {
-        Self {
-            client_name: None,
-            database: None,
-            user: None,
-            password: None,
-            compression: Compression::None,
-            read_buffer_bytes: 0,
-        }
-    }
 }
 
 impl ClientOpts {
@@ -47,33 +51,71 @@ impl ClientOpts {
         Self::default()
     }
 
+    /// Name reported to the server, default `"clickhouse-c"`.
     pub fn client_name(mut self, s: &str) -> Self {
-        self.client_name = Some(cstring(s));
+        self.client_name = Some(s.to_owned());
         self
     }
     pub fn database(mut self, s: &str) -> Self {
-        self.database = Some(cstring(s));
+        self.database = Some(s.to_owned());
         self
     }
     pub fn user(mut self, s: &str) -> Self {
-        self.user = Some(cstring(s));
+        self.user = Some(s.to_owned());
         self
     }
     pub fn password(mut self, s: &str) -> Self {
-        self.password = Some(cstring(s));
+        self.password = Some(s.to_owned());
         self
     }
 
-    pub(crate) fn to_raw(&self, codec: Option<*const sys::chc_codec>) -> sys::chc_client_opts {
-        let mut raw = sys::chc_client_opts::zeroed();
-        raw.client_name = ptr_or_null(&self.client_name);
-        raw.database = ptr_or_null(&self.database);
-        raw.user = ptr_or_null(&self.user);
-        raw.password = ptr_or_null(&self.password);
-        raw.compression = self.compression as i32;
-        raw.codec = codec.unwrap_or(core::ptr::null());
-        raw.read_buffer_bytes = self.read_buffer_bytes;
-        raw
+    pub fn client_version(mut self, major: u64, minor: u64, patch: u64) -> Self {
+        self.client_version_major = major;
+        self.client_version_minor = minor;
+        self.client_version_patch = patch;
+        self
+    }
+
+    pub fn client_revision(mut self, revision: u64) -> Self {
+        self.client_revision = revision;
+        self
+    }
+
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    pub(crate) fn to_raw(&self, codec: Option<*const sys::chc_codec>) -> Result<RawClientOpts> {
+        let mut owned = Vec::with_capacity(4);
+        let mut field = |label, value: &Option<String>| -> Result<*const c_char> {
+            let Some(value) = value else {
+                return Ok(core::ptr::null());
+            };
+            owned.push(cstring(label, value)?);
+            Ok(owned.last().expect("just pushed").as_ptr())
+        };
+        let client_name = field("client name", &self.client_name)?;
+        let database = field("database", &self.database)?;
+        let user = field("user", &self.user)?;
+        let password = field("password", &self.password)?;
+
+        Ok(RawClientOpts {
+            _owned: owned,
+            raw: sys::chc_client_opts {
+                client_name,
+                client_version_major: self.client_version_major,
+                client_version_minor: self.client_version_minor,
+                client_version_patch: self.client_version_patch,
+                client_revision: self.client_revision,
+                database,
+                user,
+                password,
+                compression: self.compression as i32,
+                codec: codec.unwrap_or(core::ptr::null()),
+                read_buffer_bytes: self.read_buffer_bytes,
+            },
+        })
     }
 
     pub(crate) fn validate_codec(&self, codec: Option<Pin<&Codec>>) -> Result<()> {
@@ -97,17 +139,17 @@ impl ClientOpts {
     }
 }
 
-fn cstring(s: &str) -> Vec<u8> {
-    let mut v = Vec::with_capacity(s.len() + 1);
-    v.extend_from_slice(s.as_bytes());
-    v.push(0);
-    v
+/// `chc_client_opts` plus the NUL-terminated copies its pointers reference.
+pub(crate) struct RawClientOpts {
+    _owned: Vec<CString>,
+    raw: sys::chc_client_opts,
 }
 
-fn ptr_or_null(buf: &Option<Vec<u8>>) -> *const c_char {
-    buf.as_deref()
-        .map(|b| b.as_ptr().cast::<c_char>())
-        .unwrap_or(core::ptr::null())
+impl RawClientOpts {
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const sys::chc_client_opts {
+        &self.raw
+    }
 }
 
 /// Information sent by the server during the Hello handshake.
@@ -161,7 +203,7 @@ pub struct Client<'fd> {
     // [`PosixIo`](crate::PosixIo) or a `tls::TlsIo`. `chc_client` retains
     // the `chc_io` pointer minted from this backend, so it must outlive
     // the client; the box keeps it pinned through `Drop`.
-    io: Pin<Box<dyn ClientIo + Send + 'fd>>,
+    io: Pin<Box<dyn Io + Send + 'fd>>,
 }
 
 impl<'fd> Client<'fd> {
@@ -169,7 +211,7 @@ impl<'fd> Client<'fd> {
     /// ownership of `io` and `codec` so the C-side back-pointers
     /// `c->io` / `c->codec` stay valid for the client's lifetime.
     ///
-    /// `io` is any [`ClientIo`] backend: [`PosixIo`](crate::PosixIo) for a
+    /// `io` is any [`Io`] backend: [`PosixIo`](crate::PosixIo) for a
     /// plaintext fd, or `tls::TlsIo` (feature `tls`) for rustls over a
     /// `TcpStream`.
     ///
@@ -192,7 +234,7 @@ impl<'fd> Client<'fd> {
     ///     Client::init(&ClientOpts::new(), Allocator::stdlib(), io, None)
     /// }
     /// ```
-    pub fn init<I: ClientIo + Send + 'fd>(
+    pub fn init<I: Io + Send + 'fd>(
         opts: &ClientOpts,
         alloc: Allocator,
         mut io: Pin<Box<I>>,
@@ -200,14 +242,14 @@ impl<'fd> Client<'fd> {
     ) -> Result<Self> {
         opts.validate_codec(codec.as_ref().map(|codec| codec.as_ref()))?;
         let codec_ptr = codec.as_ref().map(|c| c.as_ref().as_ptr());
-        let raw_opts = opts.to_raw(codec_ptr);
+        let raw_opts = opts.to_raw(codec_ptr)?;
         let alloc = Box::new(alloc);
         let mut out: *mut sys::chc_client = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_client_init(
                 &mut out,
-                &raw_opts,
+                raw_opts.as_ptr(),
                 alloc.as_ptr(),
                 io.as_mut().io_ptr(),
                 &mut err,
@@ -237,6 +279,11 @@ impl<'fd> Client<'fd> {
         self.io.as_mut().set_read_timeout(timeout)
     }
 
+    /// Send a query with no settings or parameters. The server applies
+    /// whatever its profile defaults to, which for a Native consumer means
+    /// trusting it not to have turned on binary type names; see
+    /// [`QuerySetting::TEXT_TYPE_NAMES`](crate::QuerySetting::TEXT_TYPE_NAMES)
+    /// and [`send_query_with`](Self::send_query_with).
     pub fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
         let (qid, qid_len) = query_id
             .map(|q| (q.as_ptr().cast::<c_char>(), q.len()))
@@ -255,6 +302,38 @@ impl<'fd> Client<'fd> {
         check(rc, &err)
     }
 
+    /// Send a query with per-query settings and `{name:Type}` parameters.
+    ///
+    /// ```no_run
+    /// use clickhouse_c::{QueryOpts, QueryParam, QuerySetting};
+    /// # fn run(client: &mut clickhouse_c::Client<'_>) -> clickhouse_c::Result<()> {
+    /// let settings = [
+    ///     QuerySetting::TEXT_TYPE_NAMES,
+    ///     QuerySetting::new("max_block_size", "8192"),
+    /// ];
+    /// let params = [QueryParam::new("cutoff", "100")];
+    /// client.send_query_with(
+    ///     "SELECT number FROM numbers(1000) WHERE number > {cutoff:UInt64}",
+    ///     &QueryOpts::new().settings(&settings).params(&params),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn send_query_with(&mut self, sql: &str, opts: &QueryOpts<'_>) -> Result<()> {
+        let raw_opts = RawQueryOpts::new(opts)?;
+        let mut err = sys::chc_err::zeroed();
+        let rc = unsafe {
+            sys::chc_client_send_query_ex(
+                self.raw.as_ptr(),
+                sql.as_ptr().cast::<c_char>(),
+                sql.len(),
+                raw_opts.as_ptr(),
+                &mut err,
+            )
+        };
+        check(rc, &err)
+    }
+
     /// Send a Data block. Passing [`None`] writes the empty block that
     /// terminates a query / signals "no more INSERT rows".
     pub fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
@@ -264,6 +343,15 @@ impl<'fd> Client<'fd> {
         check(rc, &err)
     }
 
+    /// Send the protocol Cancel packet, asking the server to stop producing
+    /// rows for the query in flight. Packets already on the wire still
+    /// arrive, so keep draining until `EndOfStream`.
+    ///
+    /// This is the remote half of cancellation and needs a working
+    /// connection. To stop *reading* -- because the caller is shutting down,
+    /// or the peer went quiet -- use
+    /// [`CancelToken`](crate::CancelToken), which fails local reads and
+    /// sends nothing.
     pub fn send_cancel(&mut self) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_send_cancel(self.raw.as_ptr(), &mut err) };
