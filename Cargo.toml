@@ -14,5 +14,12 @@ default = ["lz4"]
 lz4 = []
 zstd = []
 
+[dependencies]
+thiserror = "2"
+
 [build-dependencies]
 cc = "1"
+
+[[example]]
+name = "spawn_clickhouse_local"
+path = "examples/spawn_clickhouse_local.rs"
