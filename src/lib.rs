@@ -11,6 +11,9 @@
 //! * [`Client`] over a connected TCP [`PosixIo`]: full Hello / Query /
 //!   Data / EOS / Exception / Progress packet loop with optional LZ4 /
 //!   ZSTD compression.
+//! * With feature `tokio`, [`AsyncClient`] over `tokio::net::TcpStream`:
+//!   same packet loop, driven by the caller's task without a worker
+//!   thread.
 //!
 //! [`sys`] holds the raw unsafe FFI surface the safe layer wraps.
 //!
@@ -23,6 +26,8 @@
 pub mod sys;
 
 mod alloc;
+#[cfg(feature = "tokio")]
+mod async_client;
 mod block;
 mod builder;
 mod client;
@@ -32,6 +37,8 @@ mod io;
 mod types;
 
 pub use alloc::Allocator;
+#[cfg(feature = "tokio")]
+pub use async_client::AsyncClient;
 pub use block::{Block, BlockOpts, BlockReader, Column, ColumnLayout, LowCardinalityView};
 pub use builder::{BlockBuilder, ColumnBuilder};
 pub use client::{
