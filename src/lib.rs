@@ -1,11 +1,16 @@
 //! Rust bindings for [clickhouse-c], a header-only C client for the
 //! ClickHouse Native wire format.
 //!
-//! [`PosixIo`] over a pipe or socket fd, plus [`Block`] /
-//! [`BlockBuilder`], reads and writes Native blocks without going
-//! through the TCP packet loop. Suitable for piping into
-//! `clickhouse local --format Native` or for talking to any peer that
-//! speaks raw block frames.
+//! Two entry points:
+//!
+//! * [`PosixIo`] over a pipe or socket fd, plus [`Block`] /
+//!   [`BlockBuilder`]: read or write Native blocks without going through
+//!   the TCP packet loop. Suitable for piping into
+//!   `clickhouse local --format Native` or for talking to any peer that
+//!   speaks raw block frames.
+//! * [`Client`] over a connected TCP [`PosixIo`]: full Hello / Query /
+//!   Data / EOS / Exception / Progress packet loop with optional LZ4 /
+//!   ZSTD compression.
 //!
 //! [`sys`] holds the raw unsafe FFI surface the safe layer wraps.
 //!
@@ -20,6 +25,8 @@ pub mod sys;
 mod alloc;
 mod block;
 mod builder;
+mod client;
+mod codec;
 mod error;
 mod io;
 mod types;
@@ -27,6 +34,10 @@ mod types;
 pub use alloc::Allocator;
 pub use block::{Block, BlockOpts, BlockReader, Column, ColumnLayout, LowCardinalityView};
 pub use builder::{BlockBuilder, ColumnBuilder};
+pub use client::{
+    Client, ClientOpts, Event, Exception, PacketKind, ProfileInfo, Progress, ServerInfo,
+};
+pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};
 pub use io::{ClientIo, PosixIo};
 pub use types::{Kind, TypeAst, TypeRef};
