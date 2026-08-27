@@ -336,6 +336,19 @@ let mut client = AsyncClient::connect_tls(
 ).await?;
 ```
 
+Each constructor bakes the transport into the client's type. Where one field
+holds either a plaintext or a TLS connection, `boxed()` erases it into
+`BoxedAsyncClient` (`AsyncClient<Box<dyn AsyncTransport>>`), leaving one
+vtable call per socket read and write and no boxed futures:
+
+```rust,ignore
+let client: clickhouse_c::BoxedAsyncClient = if secure {
+    AsyncClient::connect_tls(addr, host, opts, None, tls::default_config()).await?.boxed()
+} else {
+    AsyncClient::connect(addr, opts, None).await?.boxed()
+};
+```
+
 Blocking — `tls::TlsIo` is a `Io` backend over an owned `TcpStream`;
 hand it to the same `Client::init` the plaintext path uses:
 

@@ -4,14 +4,17 @@
 
 mod common;
 
-use clickhouse_c::{AsyncClient, Block, BlockBuilder, ClientOpts, ColumnBuilder, Event, TypeAst};
+use clickhouse_c::{
+    AsyncClient, AsyncTransport, Block, BlockBuilder, BoxedAsyncClient, ClientOpts, ColumnBuilder,
+    Event, TypeAst,
+};
 use common::{ChServer, TestResult, clickhouse_on_path};
 
 async fn connect(server: &ChServer) -> clickhouse_c::Result<AsyncClient> {
     AsyncClient::connect(("127.0.0.1", server.tcp_port), ClientOpts::new(), None).await
 }
 
-async fn drain(client: &mut AsyncClient) -> TestResult {
+async fn drain<S: AsyncTransport>(client: &mut AsyncClient<S>) -> TestResult {
     loop {
         match client.recv_event().await? {
             Event::EndOfStream => return Ok(()),
@@ -108,6 +111,24 @@ async fn async_bad_sql_returns_exception() -> TestResult {
             _ => {}
         }
     }
+}
+
+/// A consumer wanting plaintext or TLS behind one type boxes the
+/// transport; the connection keeps working across the erasure.
+#[tokio::test(flavor = "current_thread")]
+async fn async_boxed_client_runs_query() -> TestResult {
+    if !clickhouse_on_path() {
+        eprintln!("clickhouse binary not found, skipping");
+        return Ok(());
+    }
+
+    let server = ChServer::spawn()?;
+    let mut client: BoxedAsyncClient = connect(&server).await?.boxed();
+    assert!(client.server_info().is_some());
+    client.send_query("SELECT 1", None).await?;
+    drain(&mut client).await?;
+
+    Ok(())
 }
 
 fn string_column(values: &[&str]) -> (Vec<u64>, Vec<u8>) {

@@ -460,6 +460,29 @@ loop {
 Under TLS, `AsyncClient::connect_tls` takes the SNI hostname and an
 `Arc<rustls::ClientConfig>`.
 
+The transport is part of the client's type, so a plaintext and a TLS
+connection are two types. `boxed()` erases it into `BoxedAsyncClient`, which
+is what a struct field, a pool, or a reconnect assignment wants:
+
+```rust
+use clickhouse_c::{AsyncClient, BoxedAsyncClient, ClientOpts, tls};
+
+let opts = ClientOpts::new().user("default").password("…");
+let mut client: BoxedAsyncClient = if secure {
+    AsyncClient::connect_tls(("myhost", 9440), "myhost", opts, None, tls::default_config())
+        .await?
+        .boxed()
+} else {
+    AsyncClient::connect(("127.0.0.1", 9000), opts, None).await?.boxed()
+};
+```
+
+That costs one vtable call per socket read and write, and nothing else: the
+protocol work and the method futures are untouched. Any `AsyncRead +
+AsyncWrite + Unpin + Send` stream is an `AsyncTransport`, so
+`AsyncClient::handshake_on` accepts a `Box<dyn AsyncTransport>` as readily as
+a `TcpStream`.
+
 <Note>
 `clickhouse-c` publishes no `chc_async_send_query_ex`, so the async client has
 no counterpart to `send_query_with`: per-query settings and parameters are

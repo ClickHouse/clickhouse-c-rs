@@ -272,6 +272,29 @@ async fn async_client() -> DocResult {
     Ok(())
 }
 
+async fn async_client_boxed_transport(secure: bool) -> DocResult {
+    use clickhouse_c::{AsyncClient, BoxedAsyncClient, tls};
+
+    let opts = ClientOpts::new().user("default").password("…");
+    let mut client: BoxedAsyncClient = if secure {
+        AsyncClient::connect_tls(
+            ("myhost", 9440),
+            "myhost",
+            opts,
+            None,
+            tls::default_config(),
+        )
+        .await?
+        .boxed()
+    } else {
+        AsyncClient::connect(("127.0.0.1", 9000), opts, None)
+            .await?
+            .boxed()
+    };
+    let _ = &mut client;
+    Ok(())
+}
+
 // ---- Any other runtime ---------------------------------------------------
 
 fn ioless_over_a_blocking_socket() -> DocResult {

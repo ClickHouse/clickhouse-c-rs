@@ -31,7 +31,9 @@
 //!   or event loop can drive it.
 //! * With feature `tokio`, [`AsyncClient`] over `tokio::net::TcpStream`:
 //!   [`IolessClient`] plus a byte pump, driven by the caller's task without
-//!   a worker thread.
+//!   a worker thread. It is generic over its [`AsyncTransport`];
+//!   [`AsyncClient::boxed`] erases that type into [`BoxedAsyncClient`] when
+//!   plaintext and TLS connections have to share one type.
 //! * With feature `tls`, TLS over rustls: the blocking [`Client`] on a
 //!   [`tls::TlsIo`] backend, and [`AsyncClient::connect_tls`].
 //!
@@ -89,7 +91,7 @@ mod types;
 
 pub use alloc::Allocator;
 #[cfg(feature = "tokio")]
-pub use async_client::AsyncClient;
+pub use async_client::{AsyncClient, AsyncTransport, BoxedAsyncClient};
 pub use block::{Block, BlockOpts, BlockReader, Column, ColumnLayout, LowCardinalityView};
 pub use builder::{BlockBuilder, ColumnBuilder};
 pub use client::{

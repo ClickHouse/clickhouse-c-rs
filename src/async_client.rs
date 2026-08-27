@@ -17,13 +17,33 @@ use crate::ioless::{IolessClient, Step};
 
 const DEFAULT_READ_BUF_BYTES: usize = 8 * 1024;
 
+/// Transport [`AsyncClient`] drives: a stream it owns and pumps bytes
+/// through. Blanket-implemented, so any `AsyncRead + AsyncWrite + Unpin +
+/// Send` qualifies and nothing has to implement it by hand. The `Send`
+/// bound keeps the client's method futures `Send`, which `tokio::spawn` on
+/// a multi-thread runtime requires.
+pub trait AsyncTransport: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncTransport for S {}
+
+/// [`AsyncClient`] with its transport type erased, so a plaintext and a TLS
+/// connection are one type: storable in a struct field, a `Vec`, or
+/// reassignable on reconnect without a hand-written enum delegating every
+/// method.
+///
+/// Dispatch is dynamic per socket read and write only. The protocol work
+/// and the method futures are untouched: no boxed futures, no allocation
+/// per call.
+pub type BoxedAsyncClient = AsyncClient<Box<dyn AsyncTransport>>;
+
 /// Worker-free async ClickHouse client.
 ///
 /// Generic over the transport, so a caller can bring their own
-/// `AsyncRead + AsyncWrite`: a TLS stream from another library, a proxied
-/// socket, a duplex pipe in a test. [`connect`](Self::connect) and
+/// [`AsyncTransport`]: a TLS stream from another library, a proxied socket,
+/// a duplex pipe in a test. [`connect`](Self::connect) and
 /// [`connect_tls`](Self::connect_tls) are conveniences over the two common
-/// ones.
+/// ones. [`boxed`](Self::boxed) erases the transport type when plaintext and
+/// TLS connections have to share one type.
 pub struct AsyncClient<S = TcpStream> {
     core: IolessClient,
     stream: S,
@@ -81,7 +101,7 @@ impl AsyncClient<tokio_rustls::client::TlsStream<TcpStream>> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncClient<S> {
+impl<S: AsyncTransport> AsyncClient<S> {
     /// Run the Hello handshake over an already-connected transport.
     pub async fn handshake_on(
         stream: S,
@@ -142,6 +162,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncClient<S> {
     /// Identity the server sent during the handshake.
     pub fn server_info(&self) -> Option<ServerInfo> {
         self.core.server_info()
+    }
+
+    /// Box the transport behind a trait object; see [`BoxedAsyncClient`].
+    /// The connection is untouched, so this is callable mid-stream.
+    pub fn boxed(self) -> BoxedAsyncClient
+    where
+        S: 'static,
+    {
+        AsyncClient {
+            core: self.core,
+            stream: Box::new(self.stream),
+            read_buf: self.read_buf,
+        }
     }
 
     /// The protocol machine underneath, for anything the adapter does not
@@ -205,7 +238,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncClient<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncClient, Event};
+    use super::{AsyncClient, BoxedAsyncClient, Event};
     use crate::builder::BlockBuilder;
     use crate::client::ClientOpts;
 
@@ -237,6 +270,31 @@ mod tests {
         require_send(c.send_data(Some(&bb)));
         require_send(c.send_data_end());
         require_send(c.recv_event());
+    }
+
+    // Erasure is the point of `boxed`: two transport types, one client
+    // type, so a consumer holding either needs no delegating wrapper. The
+    // erased futures must stay `Send` too.
+    #[allow(dead_code)]
+    fn boxed_clients_unify(
+        plain: AsyncClient,
+        tls_like: AsyncClient<tokio::io::DuplexStream>,
+    ) -> Vec<BoxedAsyncClient> {
+        fn require_send<T: Send>(_: T) {}
+        let mut erased = plain.boxed();
+        require_send(erased.recv_event());
+        vec![erased, tls_like.boxed()]
+    }
+
+    // The consumer case for erasure: a config flag picks plaintext or TLS,
+    // and one field holds whichever came back.
+    #[cfg(feature = "tls")]
+    #[allow(dead_code)]
+    fn plaintext_and_tls_share_one_type(
+        plain: AsyncClient,
+        tls: AsyncClient<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    ) -> Vec<BoxedAsyncClient> {
+        vec![plain.boxed(), tls.boxed()]
     }
 
     // The adapter is generic, so a caller can drive the protocol over any
