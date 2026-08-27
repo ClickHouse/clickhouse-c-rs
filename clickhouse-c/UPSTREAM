@@ -1,0 +1,2 @@
+repository = https://github.com/ClickHouse/clickhouse-c
+revision   = 87d30a2ce3580cded1c794c7579fb8be8ea1c00b

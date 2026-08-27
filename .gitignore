@@ -1,0 +1,5 @@
+/target
+Cargo.lock
+# clickhouse server test spawns drop these next to the manifest
+/access/
+/preprocessed_configs/
