@@ -62,6 +62,22 @@ chc_rs_in_new(chc_io *io, const chc_alloc *al, size_t cap,
     return CHC_OK;
 }
 
+/* Ioless counterpart: parses only bytes handed to chc_in_submit, so a caller
+ * driving its own event loop can decode Native blocks without a chc_io. */
+int
+chc_rs_in_new_ioless(const chc_alloc *al, chc_in **out, chc_err *err)
+{
+    chc_in *in = al->alloc(al->ud, sizeof *in);
+    if (!in) return chc__err_set(err, CHC_ERR_OOM, "chc_in alloc failed");
+    int rc = chc_in_init_ioless(in, al);
+    if (rc != CHC_OK) {
+        al->free(al->ud, in, sizeof *in);
+        return chc__err_set(err, rc, "chc_in_init_ioless failed");
+    }
+    *out = in;
+    return CHC_OK;
+}
+
 void
 chc_rs_in_destroy(chc_in *in, const chc_alloc *al)
 {

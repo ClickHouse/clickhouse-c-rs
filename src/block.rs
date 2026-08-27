@@ -27,7 +27,7 @@ pub enum ColumnLayout {
 }
 
 impl ColumnLayout {
-    fn from_raw(k: sys::chc_col_kind) -> Option<Self> {
+    pub(crate) fn from_raw(k: sys::chc_col_kind) -> Option<Self> {
         Some(match k {
             sys::CHC_COL_FIXED => Self::Fixed,
             sys::CHC_COL_STRING => Self::String,

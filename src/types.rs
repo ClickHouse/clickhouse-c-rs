@@ -66,6 +66,7 @@ pub enum Kind {
     AggregateFunction = sys::CHC_AGGREGATE_FUNCTION,
     SimpleAggregateFunction = sys::CHC_SIMPLE_AGGREGATE_FUNCTION,
     Nothing = sys::CHC_NOTHING,
+    QBit = sys::CHC_QBIT,
 }
 
 impl Kind {
@@ -126,6 +127,7 @@ impl Kind {
             sys::CHC_AGGREGATE_FUNCTION => Self::AggregateFunction,
             sys::CHC_SIMPLE_AGGREGATE_FUNCTION => Self::SimpleAggregateFunction,
             sys::CHC_NOTHING => Self::Nothing,
+            sys::CHC_QBIT => Self::QBit,
             _ => return None,
         })
     }
@@ -224,6 +226,24 @@ impl<'a> TypeRef<'a> {
         unsafe { sys::chc_type_datetime64_scale(self.raw) }
     }
 
+    /// `N` in `QBit(T, N)`, the vector dimension. 0 on other kinds.
+    ///
+    /// A QBit column arrives as [`ColumnLayout::Tuple`] of
+    /// [`qbit_element_size`] fixed columns, MSB bit-plane first, each row
+    /// holding `ceil(N / 8)` bytes.
+    ///
+    /// [`ColumnLayout::Tuple`]: crate::ColumnLayout::Tuple
+    /// [`qbit_element_size`]: TypeRef::qbit_element_size
+    pub fn qbit_dimension(&self) -> usize {
+        unsafe { sys::chc_type_qbit_dimension(self.raw) }
+    }
+
+    /// Width of `T` in `QBit(T, N)` in bits: 16, 32, or 64, one per
+    /// bit-plane column. 0 on other kinds.
+    pub fn qbit_element_size(&self) -> usize {
+        unsafe { sys::chc_type_qbit_element_size(self.raw) }
+    }
+
     /// Bytes the C library copied from the wire; not UTF-8-validated.
     pub fn timezone(&self) -> Option<&'a [u8]> {
         let mut len = 0;
@@ -299,5 +319,42 @@ impl<'a> TypeRef<'a> {
             unsafe { sys::chc_type_format(self.raw, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         buf.truncate(needed);
         String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, TypeAst};
+    use crate::Allocator;
+
+    fn parse(name: &str) -> TypeAst {
+        TypeAst::parse(name, Allocator::stdlib()).expect(name)
+    }
+
+    #[test]
+    fn qbit_metadata() {
+        let ty = parse("QBit(Float32, 16)");
+        let view = ty.view();
+        assert_eq!(view.kind(), Some(Kind::QBit));
+        assert_eq!(view.qbit_dimension(), 16);
+        assert_eq!(view.qbit_element_size(), 32);
+        assert_eq!(view.format(), "QBit(Float32, 16)");
+        assert_eq!(view.child(0).and_then(|c| c.kind()), Some(Kind::Float32));
+    }
+
+    #[test]
+    fn qbit_accessors_are_zero_off_qbit() {
+        let ty = parse("Array(UInt32)");
+        assert_eq!(ty.view().qbit_dimension(), 0);
+        assert_eq!(ty.view().qbit_element_size(), 0);
+    }
+
+    // Kind is #[repr(i32)] over the generated constants, so an unmapped
+    // discriminant must surface as None rather than transmuting into a
+    // neighbouring variant.
+    #[test]
+    fn unknown_discriminant_is_none() {
+        assert_eq!(Kind::from_raw(i32::MAX), None);
+        assert_eq!(Kind::from_raw(-1), None);
     }
 }

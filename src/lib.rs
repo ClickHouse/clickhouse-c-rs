@@ -25,6 +25,12 @@
 // only push parameters into ad-hoc structs without earning anything.
 #![allow(clippy::too_many_arguments)]
 
+/// Revision of the bundled [clickhouse-c] the bindings were written
+/// against, taken from `clickhouse-c/UPSTREAM` at build time.
+///
+/// [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
+pub const UPSTREAM_REVISION: &str = env!("CHC_UPSTREAM_REVISION");
+
 pub mod sys;
 
 mod alloc;
@@ -36,6 +42,8 @@ mod client;
 mod codec;
 mod error;
 mod io;
+#[cfg(test)]
+mod parity;
 #[cfg(feature = "tls")]
 pub mod tls;
 mod types;

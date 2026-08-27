@@ -106,9 +106,38 @@ pub struct chc_io {
     pub check_cancel: Option<unsafe extern "C" fn(ud: *mut c_void) -> c_int>,
 }
 
+// Buffered reader clickhouse-c parses through. The struct body lives behind
+// CHC_IMPLEMENTATION, so Rust cannot allocate one by value; chc_rs_in_new /
+// chc_rs_in_new_ioless (src/wrapper.c) box one through the caller's allocator
+// and hand back this opaque handle.
 #[repr(C)]
 pub struct chc_in {
     _opaque: [u8; 0],
+}
+
+unsafe extern "C" {
+    // Lifecycle on an already-allocated chc_in. Two modes: io-backed, which
+    // refills from a chc_io, and ioless, which parses only bytes handed to
+    // chc_in_submit and returns CHC_WOULD_BLOCK past them.
+    pub fn chc_in_init(
+        input: *mut chc_in,
+        io: *mut chc_io,
+        al: *const chc_alloc,
+        cap: usize,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_in_init_ioless(input: *mut chc_in, al: *const chc_alloc) -> c_int;
+    pub fn chc_in_submit(
+        input: *mut chc_in,
+        buf: *const c_void,
+        len: usize,
+        err: *mut chc_err,
+    ) -> c_int;
+    /// Unconsumed bytes still buffered.
+    pub fn chc_in_available(input: *const chc_in) -> usize;
+    /// Drop consumed bytes and compact.
+    pub fn chc_in_reset(input: *mut chc_in);
+    pub fn chc_in_free(input: *mut chc_in);
 }
 
 // Blocking POSIX-fd backend state for chc_io, declared in
@@ -162,6 +191,9 @@ unsafe extern "C" {
     pub fn chc_type_decimal_precision(t: *const chc_type) -> c_int;
     pub fn chc_type_decimal_scale(t: *const chc_type) -> c_int;
     pub fn chc_type_datetime64_scale(t: *const chc_type) -> c_int;
+    // QBit(T, N): N. Element width in bits (16/32/64). 0 on non-QBit types.
+    pub fn chc_type_qbit_dimension(t: *const chc_type) -> usize;
+    pub fn chc_type_qbit_element_size(t: *const chc_type) -> usize;
     pub fn chc_type_timezone(t: *const chc_type, out_len: *mut usize) -> *const c_char;
     pub fn chc_type_name(t: *const chc_type, out_len: *mut usize) -> *const c_char;
 
@@ -323,6 +355,11 @@ unsafe extern "C" {
         io: *mut chc_io,
         al: *const chc_alloc,
         cap: usize,
+        out: *mut *mut chc_in,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_rs_in_new_ioless(
+        al: *const chc_alloc,
         out: *mut *mut chc_in,
         err: *mut chc_err,
     ) -> c_int;

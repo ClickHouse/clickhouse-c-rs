@@ -11,6 +11,16 @@ ClickHouse Native wire format. Two entry points:
 
 [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
 
+```toml
+[dependencies]
+clickhouse-c-rs = "0.1"
+```
+
+No features are on by default, so the base crate needs only a C compiler
+and libc. The `lz4` and `zstd` features each link a system library and
+need its development package (`liblz4-dev` / `libzstd-dev` on Debian,
+`lz4` / `zstd` on Homebrew); `build.rs` locates them with `pkg-config`.
+
 ## Architecture
 
 1. **Vendored headers** under `clickhouse-c/`, pinned by
@@ -20,10 +30,15 @@ ClickHouse Native wire format. Two entry points:
    & includes each header the configured features select. `build.rs`
    compiles it via the `cc` crate into a static library. LZ4 / ZSTD
    link separately under their feature flags.
-3. **`src/sys.rs`** — FFI declarations for every public symbol &
-   struct from `clickhouse.h`, `clickhouse-posix-io.h`,
-   `clickhouse-compression.h`, `clickhouse-client.h`, plus the
-   feature-gated codec inits. Integer constants from `enum` blocks
+3. **`src/sys.rs`** — FFI declarations for the public symbols &
+   structs of `clickhouse.h`, `clickhouse-posix-io.h`,
+   `clickhouse-compression.h`, `clickhouse-client.h`, and
+   `clickhouse-async.h`. `src/parity.rs` checks that claim against the
+   headers on every test run, so an upstream bump that adds a function
+   or an enum member fails a test rather than going unnoticed.
+   `clickhouse-openssl.h` is shipped but not bound: it is there for
+   callers wiring their own OpenSSL `chc_io`. Integer constants from
+   `enum` blocks
    (`chc_kind`, `chc_col_kind`, `chc_compression`, `chc_packet_kind`,
    error codes) & a couple of `#define`s are scanned out of the
    headers by `build.rs` into `$OUT_DIR/sys_constants.rs` & pulled in
@@ -200,7 +215,7 @@ let sock = TcpStream::connect("localhost:9000")?;
 // `PosixIo::new(sock.as_fd())` — `Client<'_>` then borrows from `sock`.
 let io = PosixIo::new_owned(sock);
 
-let codec = Codec::lz4();        // feature = "lz4" (default)
+let codec = Codec::lz4();        // feature = "lz4"
 let mut opts = ClientOpts::new()
     .database("default")
     .user("default")
@@ -267,18 +282,16 @@ let mut client = Client::init(
 
 ## Feature flags
 
-| Feature | Default | Effect |
+All off by default.
+
+| Feature | Effect | Needs |
 |---|---|---|
-| `lz4`   | on      | compile clickhouse-compression.h's LZ4 wrapper, link `-llz4`, expose `Codec::lz4()` |
-| `tls`   | off     | rustls TLS: `tls::TlsIo` backend for the blocking `Client`, `AsyncClient::connect_tls`, `tls::default_config()` (webpki roots) |
-| `tokio` | off     | expose `AsyncClient` over `tokio::net::TcpStream` |
-| `zstd`  | off     | compile clickhouse-compression.h's ZSTD wrapper, link `-lzstd`, expose `Codec::zstd()` |
+| `lz4`   | compile clickhouse-compression.h's LZ4 wrapper, link `-llz4`, expose `Codec::lz4()` | system `liblz4` |
+| `tls`   | rustls TLS: `tls::TlsIo` backend for the blocking `Client`, `AsyncClient::connect_tls`, `tls::default_config()` (webpki roots) | `rustls`, `webpki-roots`, `tokio-rustls` |
+| `tokio` | expose `AsyncClient` over `tokio::net::TcpStream` | `tokio` |
+| `zstd`  | compile clickhouse-compression.h's ZSTD wrapper, link `-lzstd`, expose `Codec::zstd()` | system `libzstd` |
 
-`tls` pulls in `rustls` + `webpki-roots` (+ `tokio-rustls` for the async
-path). Async TLS needs both `tls` and `tokio`.
-
-`default-features = false` for an uncompressed-only build with no
-compression libs linked.
+Async TLS needs both `tls` and `tokio`.
 
 ## Header vendoring
 

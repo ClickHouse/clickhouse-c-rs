@@ -2,15 +2,41 @@
 name = "clickhouse-c-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Rust bindings for clickhouse-c, the header-only C client for the ClickHouse Native wire format"
+repository = "https://github.com/ClickHouse/clickhouse-c-rs"
+documentation = "https://docs.rs/clickhouse-c-rs"
+readme = "README.md"
 license = "Apache-2.0"
+keywords = ["clickhouse", "database", "native", "ffi", "bindings"]
+categories = ["database", "api-bindings", "external-ffi-bindings"]
+# Bundled clickhouse-c exports global C symbols. `links` makes Cargo reject a
+# dependency graph holding two copies, which would be a duplicate-symbol link
+# error or, worse, silent interposition of mismatched ABIs.
+links = "clickhouse-c"
+include = [
+    "/build.rs",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/clickhouse-c/LICENSE",
+    "/clickhouse-c/UPSTREAM",
+    "/clickhouse-c/*.h",
+    "/examples/*.rs",
+    "/src/*.c",
+    "/src/*.rs",
+    "/tests/*.rs",
+]
 
 [lib]
 name = "clickhouse_c"
 path = "src/lib.rs"
 
+# Empty by default: the base crate needs only a C compiler and libc, matching
+# what `#include "clickhouse.h"` alone costs in C. `lz4` and `zstd` each link a
+# system library, so they are opt-in.
 [features]
-default = ["lz4"]
+default = []
 lz4 = []
 tls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
 tokio = ["dep:tokio"]
@@ -25,9 +51,13 @@ tokio-rustls = { version = "0.26", default-features = false, optional = true }
 
 [build-dependencies]
 cc = "1"
+pkg-config = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[example]]
 name = "spawn_clickhouse_local"
