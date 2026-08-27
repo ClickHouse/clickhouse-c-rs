@@ -183,6 +183,8 @@ impl<'a> Default for BlockBuilder<'a> {
 }
 
 impl<'a> BlockBuilder<'a> {
+    /// An empty block. Row count is fixed by the first
+    /// [`append`](Self::append).
     pub fn new() -> Self {
         Self {
             cols: Vec::new(),

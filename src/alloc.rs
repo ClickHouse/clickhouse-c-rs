@@ -3,6 +3,11 @@ use core::ffi::c_void;
 
 use crate::sys;
 
+/// The `chc_alloc` vtable every owning handle carries.
+///
+/// `Copy`, and `Send + Sync` because the vtable is stateless function
+/// pointers. Whatever allocated an object must free it, so each handle keeps
+/// the allocator it was built with and calls the matching destroy on drop.
 #[derive(Clone, Copy)]
 pub struct Allocator {
     pub(crate) raw: sys::chc_alloc,

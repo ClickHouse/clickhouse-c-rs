@@ -14,15 +14,35 @@ use crate::io::Io;
 use crate::sys;
 use crate::types::TypeRef;
 
+/// Physical shape of a decoded column.
+///
+/// Deliberately far smaller than [`Kind`](crate::Kind): many logical
+/// ClickHouse types share one layout, and the type is what tells them apart.
+/// Read the layout to know how to walk the bytes, the
+/// [`column_type`](Block::column_type) to know what they mean.
 #[derive(Clone, Copy, Debug)]
 #[repr(i32)]
 pub enum ColumnLayout {
+    /// Contiguous little-endian elements of one width. Every scalar lands
+    /// here: integers, floats, `Bool`, `Date`, `DateTime`, `Decimal`,
+    /// `UUID`, `IPv4`/`IPv6`, `FixedString`, `Enum8`/`Enum16`, `Interval`.
     Fixed = sys::CHC_COL_FIXED,
+    /// Offsets plus a byte slab. `String`, and also `JSON` / `Object` under
+    /// their string serialization.
     String = sys::CHC_COL_STRING,
+    /// Null map plus a dense inner column: `Nullable(T)`.
     Nullable = sys::CHC_COL_NULLABLE,
+    /// Offsets plus an element column: `Array(T)`, and `Map(K, V)` as
+    /// `Array(Tuple(K, V))`.
     Array = sys::CHC_COL_ARRAY,
+    /// Parallel child columns: `Tuple`, `Nested`, the geo types
+    /// (`Point`/`Ring`/`Polygon`/`MultiPolygon`), and `QBit` as one fixed
+    /// bit-plane column per element bit.
     Tuple = sys::CHC_COL_TUPLE,
+    /// Keys plus a dictionary column: `LowCardinality(T)`.
     LowCardinality = sys::CHC_COL_LOW_CARDINALITY,
+    /// No values at all: `Nothing`, and the inner column of an
+    /// all-NULL `Nullable(Nothing)`.
     Nothing = sys::CHC_COL_NOTHING,
 }
 
@@ -41,6 +61,12 @@ impl ColumnLayout {
     }
 }
 
+/// Which optional prefixes the block frames on the wire carry.
+///
+/// The Native *format* (what `clickhouse local` writes) and the Native
+/// *protocol* (what a TCP connection carries) differ by a couple of headers,
+/// and the protocol's depend on the negotiated server revision. Get these
+/// wrong and decoding desynchronizes on the first block.
 #[derive(Clone, Copy, Default)]
 pub struct BlockOpts {
     /// TCP path (server_revision >= 51903) ships an 8-byte BlockInfo prefix.
@@ -127,9 +153,18 @@ impl Block {
         }
     }
 
-    /// Validate every column with [`Column::validate`]. `chc_block_read`
-    /// does not check cross-field invariants, so call this on blocks
-    /// decoded from an untrusted peer before traversing them.
+    /// Validate every column with [`Column::validate`].
+    ///
+    /// **Trust boundary.** Decoding is bounded by each column's own row
+    /// count, so the accessors here are safe on any input. What decoding
+    /// does *not* check is agreement *between* columns -- array offsets
+    /// non-decreasing, LowCardinality keys inside the dictionary. Code that
+    /// walks a block using those offsets or keys as indices should call this
+    /// first on anything a peer sent; skipping it turns a forged block into
+    /// a panic or nonsense values in consumer code.
+    ///
+    /// Opt-in because the cost is proportional to row count and a caller
+    /// reading only, say, a fixed column pays for nothing.
     pub fn validate(&self) -> Result<()> {
         for i in 0..self.n_columns() {
             if let Some(col) = self.column(i) {
@@ -139,10 +174,13 @@ impl Block {
         Ok(())
     }
 
+    /// Server-set flag marking a block truncated by `max_rows_to_group_by`
+    /// with `group_by_overflow_mode = 'any'`.
     pub fn is_overflows(&self) -> bool {
         unsafe { sys::chc_block_is_overflows(self.raw.as_ptr().cast_const()) }
     }
 
+    /// Two-level aggregation bucket, or -1 outside that path.
     pub fn bucket_num(&self) -> i32 {
         unsafe { sys::chc_block_bucket_num(self.raw.as_ptr().cast_const()) }
     }
@@ -271,6 +309,9 @@ impl<'b> Column<'b> {
 
     /// String column: `(offsets, data)`. `offsets[i]` is the cumulative
     /// end of row `i` in `data` (exclusive ends, host byte order).
+    ///
+    /// Also the physical shape of `JSON` / `Object` and of a
+    /// LowCardinality dictionary.
     pub fn string(&self) -> Option<(&'b [u64], &'b [u8])> {
         let Some(ColumnLayout::String) = self.layout() else {
             return None;
@@ -282,11 +323,19 @@ impl<'b> Column<'b> {
             return None;
         }
         let offsets = unsafe { slice::from_raw_parts(offsets_ptr, n) };
+        // The data slab's length is a different field from the offsets, so
+        // trusting the final offset alone would build a slice past the
+        // allocation if the two ever disagreed. Take the capacity the column
+        // records and use the smaller: a mismatch truncates rather than
+        // reading out of bounds.
+        // SAFETY: layout is String, so the `str_` arm is the live one.
+        let capacity = unsafe { (*self.raw).payload.str_.bytes };
+        let claimed = offsets.last().copied().unwrap_or(0) as usize;
         debug_assert!(
-            offsets.windows(2).all(|w| w[0] <= w[1]),
-            "clickhouse-c published non-monotone string offsets",
+            offsets.windows(2).all(|w| w[0] <= w[1]) && claimed <= capacity,
+            "clickhouse-c published string offsets outside its own data slab",
         );
-        let data_len = offsets.last().copied().unwrap_or(0) as usize;
+        let data_len = claimed.min(capacity);
         let data = if data_len == 0 || data_ptr.is_null() {
             &[][..]
         } else {
@@ -390,8 +439,13 @@ impl<'b> Column<'b> {
     }
 }
 
+/// A `LowCardinality` column split into its parts.
 pub struct LowCardinalityView<'b> {
+    /// Width of one key in bytes: 1, 2, 4, or 8.
     pub key_size: usize,
+    /// `n_rows * key_size` raw bytes, host byte order. Each key indexes
+    /// `dict`; [`Column::validate`] is what proves they are in range.
     pub keys: &'b [u8],
+    /// The dictionary the keys index.
     pub dict: Column<'b>,
 }

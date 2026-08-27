@@ -11,17 +11,22 @@ use core::pin::Pin;
 
 use crate::sys;
 
+/// Frame compression negotiated for a connection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Compression {
+    /// Blocks travel uncompressed. Needs no [`Codec`].
     #[default]
     None = sys::CHC_COMP_NONE,
+    /// Needs a codec with the `lz4_*` slots filled, eg [`Codec::lz4`].
     Lz4 = sys::CHC_COMP_LZ4,
+    /// Needs a codec with the `zstd_*` slots filled, eg [`Codec::zstd`].
     Zstd = sys::CHC_COMP_ZSTD,
 }
 
 /// Owns a `chc_codec`. Constructed via the codec-specific factory
-/// (`Codec::lz4()`, `Codec::zstd()`) or by hand-filling [`raw_mut`].
+/// ([`Codec::lz4`], [`Codec::zstd`]), [`Codec::empty`] plus
+/// [`Codec::raw_mut`], or [`Codec::from_raw`].
 ///
 /// The struct is pinned because compression code calls back into the
 /// function-pointer table by address.
@@ -69,6 +74,7 @@ impl Codec {
         })
     }
 
+    /// clickhouse-compression.h's LZ4 adapter over the system `liblz4`.
     #[cfg(feature = "lz4")]
     pub fn lz4() -> Pin<Box<Self>> {
         let mut b = Self::empty();
@@ -79,6 +85,7 @@ impl Codec {
         b
     }
 
+    /// clickhouse-compression.h's ZSTD adapter over the system `libzstd`.
     #[cfg(feature = "zstd")]
     pub fn zstd() -> Pin<Box<Self>> {
         let mut b = Self::empty();

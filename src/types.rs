@@ -190,6 +190,9 @@ impl<'a> TypeRef<'a> {
         Kind::from_raw(unsafe { sys::chc_type_kind(self.raw) })
     }
 
+    /// Child types: the element of an `Array`, the fields of a `Tuple`, the
+    /// key and value of a `Map`, the inner type of a `Nullable` or
+    /// `LowCardinality`.
     pub fn n_children(&self) -> usize {
         unsafe { sys::chc_type_n_children(self.raw) }
     }
@@ -206,22 +209,30 @@ impl<'a> TypeRef<'a> {
         }
     }
 
+    /// `N` in `FixedString(N)`, else 0. For the width of any scalar's
+    /// storage use [`elem_size`](Self::elem_size).
     pub fn fixed_size(&self) -> i32 {
         unsafe { sys::chc_type_fixed_size(self.raw) }
     }
 
+    /// Bytes one value of this type occupies in a
+    /// [`Fixed`](crate::ColumnLayout::Fixed) column, 0 for types with no
+    /// fixed width.
     pub fn elem_size(&self) -> usize {
         unsafe { sys::chc_type_elem_size(self.raw) }
     }
 
+    /// `P` in `Decimal(P, S)`, else 0.
     pub fn decimal_precision(&self) -> i32 {
         unsafe { sys::chc_type_decimal_precision(self.raw) }
     }
 
+    /// `S` in `Decimal(P, S)`, else 0.
     pub fn decimal_scale(&self) -> i32 {
         unsafe { sys::chc_type_decimal_scale(self.raw) }
     }
 
+    /// Sub-second digits in `DateTime64(S)` / `Time64(S)`, else 0.
     pub fn datetime64_scale(&self) -> i32 {
         unsafe { sys::chc_type_datetime64_scale(self.raw) }
     }
@@ -267,6 +278,7 @@ impl<'a> TypeRef<'a> {
         }
     }
 
+    /// Entries in an `Enum8` / `Enum16`, else 0.
     pub fn enum_count(&self) -> usize {
         unsafe { sys::chc_type_enum_count(self.raw) }
     }

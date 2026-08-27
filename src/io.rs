@@ -96,6 +96,7 @@ pub unsafe trait Io {
 pub struct CancelToken(Arc<AtomicBool>);
 
 impl CancelToken {
+    /// A token that starts un-cancelled.
     pub fn new() -> Self {
         Self::default()
     }
@@ -107,6 +108,7 @@ impl CancelToken {
         self.0.store(true, Ordering::Relaxed);
     }
 
+    /// Whether [`cancel`](Self::cancel) has been called on any clone.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
@@ -119,6 +121,9 @@ unsafe extern "C" fn check_cancel_flag(ud: *mut c_void) -> bool {
     unsafe { &*ud.cast::<AtomicBool>() }.load(Ordering::Relaxed)
 }
 
+/// [`Io`] over a blocking file descriptor, using clickhouse-c's posix-io
+/// backend. Covers TCP sockets and pipes alike, which is what the
+/// `clickhouse local` path needs.
 pub struct PosixIo<'fd> {
     state: sys::chc_posix_io,
     io: sys::chc_io,

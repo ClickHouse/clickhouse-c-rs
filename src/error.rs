@@ -4,17 +4,33 @@ use core::ffi::c_int;
 
 use crate::sys;
 
+/// Safe mirror of clickhouse-c's `CHC_ERR_*` codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// Transport failure, or a read deadline elapsed.
     Io,
+    /// Stream ended where more bytes were required.
     Eof,
+    /// Wire bytes did not parse: bad framing, an unknown packet, a length
+    /// that does not fit its buffer.
     Protocol,
+    /// A type name did not parse, or a column did not match its type.
     Type,
+    /// The allocator returned null.
     Oom,
+    /// A [`CancelToken`](crate::CancelToken) was set before this read.
     Cancelled,
+    /// The server sent an exception; `server_code` and `server_name` carry
+    /// its identity.
     Server,
+    /// The caller broke an API contract: mismatched row counts, a codec that
+    /// cannot do the selected compression, an interior NUL in a C string.
     Usage,
+    /// The ioless client needs more submitted bytes to make progress. Never
+    /// produced by the blocking client.
     WouldBlock,
+    /// A code this crate does not map, meaning the vendored headers grew one
+    /// without a matching variant here.
     Other(c_int),
 }
 
@@ -35,12 +51,16 @@ impl ErrorKind {
     }
 }
 
+/// Anything this crate can fail with.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("clickhouse-c: {kind:?}: {message}")]
 pub struct Error {
     pub kind: ErrorKind,
+    /// ClickHouse error code when `kind` is [`ErrorKind::Server`], else 0.
     pub server_code: i32,
+    /// Copied out of the C `chc_err` buffer, which does not outlive the call.
     pub message: String,
+    /// Server-side exception name when `kind` is [`ErrorKind::Server`].
     pub server_name: String,
 }
 
@@ -70,6 +90,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// `Result` with this crate's [`Error`].
 pub type Result<T> = core::result::Result<T, Error>;
 
 fn cstr_array_to_string(buf: &[core::ffi::c_char]) -> String {

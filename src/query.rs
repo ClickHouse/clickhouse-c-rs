@@ -24,6 +24,7 @@ pub struct QuerySetting<'a> {
 }
 
 impl<'a> QuerySetting<'a> {
+    /// A plain setting: not important, not custom.
     pub const fn new(name: &'a str, value: &'a str) -> Self {
         Self {
             name,
@@ -33,11 +34,13 @@ impl<'a> QuerySetting<'a> {
         }
     }
 
+    /// Set [`important`](Self::important).
     pub const fn important(mut self) -> Self {
         self.important = true;
         self
     }
 
+    /// Set [`custom`](Self::custom).
     pub const fn custom(mut self) -> Self {
         self.custom = true;
         self
@@ -72,6 +75,7 @@ pub struct QueryParam<'a> {
 }
 
 impl<'a> QueryParam<'a> {
+    /// `value` must be single-quoted; see the type docs.
     pub const fn new(name: &'a str, value: &'a str) -> Self {
         Self { name, value }
     }
@@ -88,6 +92,7 @@ pub struct QueryOpts<'a> {
 }
 
 impl<'a> QueryOpts<'a> {
+    /// No query id, no settings, no parameters.
     pub const fn new() -> Self {
         Self {
             query_id: None,
@@ -96,16 +101,19 @@ impl<'a> QueryOpts<'a> {
         }
     }
 
+    /// Set the server-side query id.
     pub const fn query_id(mut self, id: &'a str) -> Self {
         self.query_id = Some(id);
         self
     }
 
+    /// Replace the settings list.
     pub const fn settings(mut self, settings: &'a [QuerySetting<'a>]) -> Self {
         self.settings = settings;
         self
     }
 
+    /// Replace the parameter list.
     pub const fn params(mut self, params: &'a [QueryParam<'a>]) -> Self {
         self.params = params;
         self
@@ -243,7 +251,11 @@ mod tests {
         assert_eq!(c.n_params, 1);
         assert_eq!(c.query_id_len, 3);
 
-        let cstr = |p| unsafe { core::ffi::CStr::from_ptr(p) }.to_str().expect("utf8");
+        let cstr = |p| {
+            unsafe { core::ffi::CStr::from_ptr(p) }
+                .to_str()
+                .expect("utf8")
+        };
         let first = unsafe { &*c.settings };
         assert_eq!(
             cstr(first.name),

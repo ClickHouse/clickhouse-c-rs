@@ -83,6 +83,9 @@ pub struct AsyncClient {
 }
 
 impl AsyncClient {
+    /// TCP-connect and run the Hello handshake. Sets `TCP_NODELAY`:
+    /// Native is request/response, so Nagle only adds latency to the small
+    /// writes between blocks.
     pub async fn connect<A>(
         addr: A,
         opts: ClientOpts,
@@ -197,6 +200,7 @@ impl AsyncClient {
         self.drain_out().await
     }
 
+    /// Send a Data block, or the empty terminator with [`None`].
     pub async fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
         self.drain_out().await?;
         {
@@ -208,6 +212,7 @@ impl AsyncClient {
         self.drain_out().await
     }
 
+    /// Close an INSERT's data stream.
     pub async fn send_data_end(&mut self) -> Result<()> {
         self.drain_out().await?;
         {
@@ -218,10 +223,13 @@ impl AsyncClient {
         self.drain_out().await
     }
 
+    /// Await the next server event, pumping the socket as needed. Any block
+    /// or exception payload is owned by the returned [`Event`].
     pub async fn recv_event(&mut self) -> Result<Event> {
         self.pump_until_ok(|this| this.recv_event_step()).await
     }
 
+    /// Identity the server sent during the handshake.
     pub fn server_info(&self) -> Option<ServerInfo> {
         let p = unsafe { sys::chc_async_server_info(self.raw.as_ptr().cast_const()) };
         if p.is_null() {

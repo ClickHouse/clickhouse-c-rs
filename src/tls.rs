@@ -2,8 +2,8 @@
 //!
 //! Two surfaces:
 //!
-//! * [`TlsIo`] — a [`Io`](crate::Io) backend for the blocking
-//!   [`Client`](crate::Client). It owns a rustls [`StreamOwned`] over a
+//! * [`TlsIo`] — an [`Io`] backend for the blocking
+//!   [`Client`](crate::Client). It owns a rustls `StreamOwned` over a
 //!   `std::net::TcpStream` and exposes a `chc_io` vtable whose read/write
 //!   callbacks drive `SSL`-equivalent rustls I/O. The C client never sees
 //!   the socket, mirroring the plaintext [`PosixIo`](crate::PosixIo) path.

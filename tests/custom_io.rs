@@ -107,7 +107,10 @@ fn composite_block_round_trips_through_a_custom_backend() {
     let lc_ty = TypeAst::parse("LowCardinality(String)", alloc).expect("lc type");
 
     // Three arrays over four elements: [10, NULL], [], [30, 40].
-    let values: Vec<u8> = [10u32, 0, 30, 40].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let values: Vec<u8> = [10u32, 0, 30, 40]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let null_map = [0u8, 1, 0, 0];
     let array_offsets = [2u64, 2, 4];
 
@@ -123,8 +126,12 @@ fn composite_block_round_trips_through_a_custom_backend() {
     let lc = dict.low_cardinality(1, &keys, 3).expect("lc");
 
     let mut builder = BlockBuilder::new();
-    builder.append("nums", array_ty.view(), &array).expect("append nums");
-    builder.append("tag", lc_ty.view(), &lc).expect("append tag");
+    builder
+        .append("nums", array_ty.view(), &array)
+        .expect("append nums");
+    builder
+        .append("tag", lc_ty.view(), &lc)
+        .expect("append tag");
 
     let mut io = MemIo::new();
     builder

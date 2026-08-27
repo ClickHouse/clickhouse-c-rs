@@ -153,7 +153,9 @@ impl TlsServer {
 /// rustls config pinning the test CA as the sole root.
 fn pinned_config(server: &TlsServer) -> TestResult<Arc<rustls::ClientConfig>> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(rustls::pki_types::CertificateDer::from(server.ca_der.clone()))?;
+    roots.add(rustls::pki_types::CertificateDer::from(
+        server.ca_der.clone(),
+    ))?;
     Ok(tls::config_with_roots(roots))
 }
 

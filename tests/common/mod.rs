@@ -74,7 +74,10 @@ impl ChServer {
         ];
         if let (Some(port), Some((cert, key))) = (secure_port, tls) {
             args.push(format!("--tcp_port_secure={port}"));
-            args.push(format!("--openSSL.server.certificateFile={}", cert.display()));
+            args.push(format!(
+                "--openSSL.server.certificateFile={}",
+                cert.display()
+            ));
             args.push(format!("--openSSL.server.privateKeyFile={}", key.display()));
             args.push("--openSSL.server.verificationMode=none".to_string());
         }

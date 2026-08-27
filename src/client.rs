@@ -47,6 +47,8 @@ pub struct ClientOpts {
 }
 
 impl ClientOpts {
+    /// Defaults throughout: user `default`, database `default`, empty
+    /// password, no compression.
     pub fn new() -> Self {
         Self::default()
     }
@@ -56,19 +58,24 @@ impl ClientOpts {
         self.client_name = Some(s.to_owned());
         self
     }
+    /// Default database for unqualified table names.
     pub fn database(mut self, s: &str) -> Self {
         self.database = Some(s.to_owned());
         self
     }
+    /// Account to authenticate as.
     pub fn user(mut self, s: &str) -> Self {
         self.user = Some(s.to_owned());
         self
     }
+    /// Sent in cleartext inside the Hello body: use TLS on an untrusted
+    /// network.
     pub fn password(mut self, s: &str) -> Self {
         self.password = Some(s.to_owned());
         self
     }
 
+    /// Set all three version components at once.
     pub fn client_version(mut self, major: u64, minor: u64, patch: u64) -> Self {
         self.client_version_major = major;
         self.client_version_minor = minor;
@@ -76,11 +83,14 @@ impl ClientOpts {
         self
     }
 
+    /// Protocol revision to ask for; see [`client_revision`](Self::client_revision).
     pub fn client_revision(mut self, revision: u64) -> Self {
         self.client_revision = revision;
         self
     }
 
+    /// Anything but [`Compression::None`] also needs a matching [`Codec`]
+    /// passed to [`Client::init`].
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
@@ -185,9 +195,9 @@ fn cstr_array_to_string(buf: &[c_char]) -> String {
 }
 
 /// Open ClickHouse client. Owns the underlying `chc_client *`, the
-/// [`PosixIo`] it talks through, and (when compressed) its [`Codec`];
-/// Rust drop order guarantees the C-side back-pointers stay valid
-/// through close.
+/// [`Io`](crate::Io) backend it talks through, and (when compressed) its
+/// [`Codec`]; Rust drop order guarantees the C-side back-pointers stay
+/// valid through close.
 pub struct Client<'fd> {
     raw: NonNull<sys::chc_client>,
     // `chc_client_init` stashes `c->al = al`, i.e. it stores a pointer
@@ -264,6 +274,7 @@ impl<'fd> Client<'fd> {
         })
     }
 
+    /// Identity the server sent during the handshake.
     pub fn server_info(&self) -> Option<ServerInfo> {
         let p = unsafe { sys::chc_client_server_info(self.raw.as_ptr().cast_const()) };
         if p.is_null() {
@@ -358,6 +369,8 @@ impl<'fd> Client<'fd> {
         check(rc, &err)
     }
 
+    /// Send a Ping. The server answers [`Event::Pong`]; useful for probing
+    /// a connection between queries.
     pub fn send_ping(&mut self) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_send_ping(self.raw.as_ptr(), &mut err) };
@@ -403,20 +416,26 @@ impl Exception {
         Self { raw, alloc }
     }
 
+    /// ClickHouse error code, matching `system.errors`.
     pub fn code(&self) -> i32 {
         unsafe { (*self.raw.as_ptr()).code }
     }
 
+    /// Exception class name. Server-controlled bytes, not UTF-8-validated.
     pub fn name(&self) -> &[u8] {
         let r = unsafe { self.raw.as_ref() };
         cstr_bytes(r.name, r.name_len)
     }
 
+    /// Human-readable message. Server-controlled bytes, not
+    /// UTF-8-validated.
     pub fn display_text(&self) -> &[u8] {
         let r = unsafe { self.raw.as_ref() };
         cstr_bytes(r.display_text, r.display_text_len)
     }
 
+    /// Server stack trace, empty unless the server was asked for one.
+    /// Server-controlled bytes, not UTF-8-validated.
     pub fn stack_trace(&self) -> &[u8] {
         let r = unsafe { self.raw.as_ref() };
         cstr_bytes(r.stack_trace, r.stack_trace_len)
@@ -481,6 +500,8 @@ fn cstr_bytes<'a>(ptr: *mut c_char, len: usize) -> &'a [u8] {
     unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) }
 }
 
+/// Server-to-client packet tags. `CHC_PKT_HELLO` has no variant: the Hello
+/// exchange happens inside [`Client::init`], never as a received packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum PacketKind {
@@ -519,18 +540,30 @@ impl PacketKind {
 /// Owned server event from the packet loop, shared by [`Client`] and the
 /// async client. Any block / exception payload is owned here and freed on
 /// drop. Reading the `kind`-selected union arm happens once, in
-/// [`Event::from_raw`], so consumers never touch the raw union.
+/// `Event::from_raw`, so consumers never touch the raw union.
 pub enum Event {
+    /// A result block, or an INSERT's expected-structure block.
     Data(Block),
+    /// The `WITH TOTALS` row.
     Totals(Block),
+    /// The `WITH EXTREMES` min/max rows.
     Extremes(Block),
+    /// Server log lines, when `send_logs_level` asks for them.
     Log(Block),
+    /// Per-query profile-event counters.
     ProfileEvents(Block),
+    /// The query failed. Nothing more arrives on this query.
     Exception(Exception),
+    /// Incremental read/write counters; sent repeatedly during a query.
     Progress(Progress),
+    /// Row and byte totals, sent once near the end of a query.
     ProfileInfo(ProfileInfo),
+    /// Reply to [`Client::send_ping`].
     Pong,
+    /// The query is done. Stop draining.
     EndOfStream,
+    /// Column metadata for an INSERT target. The payload is not decoded;
+    /// the following Data block carries the same structure.
     TableColumns,
 }
 
@@ -585,6 +618,8 @@ fn take_exception(raw: &mut sys::chc_packet, alloc: Allocator) -> Result<Excepti
     Ok(unsafe { Exception::from_raw(p, alloc) })
 }
 
+/// Incremental counters for the query in flight. Each packet reports a
+/// delta, not a running total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
     pub rows: u64,
@@ -606,6 +641,7 @@ impl Progress {
     }
 }
 
+/// End-of-query totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileInfo {
     pub rows: u64,

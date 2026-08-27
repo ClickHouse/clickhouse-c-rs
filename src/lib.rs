@@ -1,7 +1,21 @@
 //! Rust bindings for [clickhouse-c], a header-only C client for the
 //! ClickHouse Native wire format.
 //!
-//! Two entry points:
+//! # Three layers
+//!
+//! 1. [`sys`] — the unsafe FFI surface. Every public function, struct, and
+//!    constant of the vendored headers, checked against them on every test
+//!    run so an upstream bump cannot drift past unnoticed. Reach here for
+//!    anything the safe layer does not wrap.
+//! 2. Safe protocol and block primitives — [`TypeAst`], [`Block`],
+//!    [`BlockReader`], [`BlockBuilder`], [`Client`], [`Codec`],
+//!    [`Allocator`]. Ownership, lifetimes, and the C destroy calls, and
+//!    nothing else: no pooling, no retries, no row mapping.
+//! 3. Optional transport adapters — [`PosixIo`] always, [`AsyncClient`]
+//!    under feature `tokio`, [`tls`] under feature `tls`. All three sit on
+//!    the [`Io`] trait, which a consumer can implement for any transport.
+//!
+//! # Entry points
 //!
 //! * [`BlockReader`] / [`BlockBuilder`] over any [`Io`] backend: read or
 //!   write Native blocks without going through the TCP packet loop.
@@ -17,7 +31,26 @@
 //! * With feature `tls`, TLS over rustls: the blocking [`Client`] on a
 //!   [`tls::TlsIo`] backend, and [`AsyncClient::connect_tls`].
 //!
-//! [`sys`] holds the raw unsafe FFI surface the safe layer wraps.
+//! # Safety model
+//!
+//! Soundness of the safe API rests on clickhouse-c, at the bundled
+//! [`UPSTREAM_REVISION`], holding the invariants its headers document.
+//! Where a cross-check costs a line it is made, and where a length could be
+//! read from two fields the smaller wins, so a C-side bug truncates rather
+//! than reading out of bounds.
+//!
+//! Decoding bounds every slice by the owning column's own row count, so the
+//! accessors are safe on any input. Agreement *between* columns is not
+//! checked: see [`Block::validate`] before walking a peer's block by its
+//! offsets or dictionary keys.
+//!
+//! Self-referential C structs ([`PosixIo`], [`Codec`], `tls::TlsIo`) hand
+//! out `Pin<Box<Self>>`, because the C side stores pointers back into them.
+//!
+//! Every owning handle is `Send`. The builders are also `Sync`, since a
+//! shared reference to one only exposes reads; the connection handles are
+//! not, matching clickhouse-c's single-threaded client. [`Allocator`] is
+//! `Copy + Send + Sync`, being a stateless vtable.
 //!
 //! [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
 

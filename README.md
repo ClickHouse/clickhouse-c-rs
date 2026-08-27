@@ -51,14 +51,22 @@ need its development package (`liblz4-dev` / `libzstd-dev` on Debian,
 
 ## Safety model
 
-**Trusted base.** Soundness of every non-`unsafe` API in this crate is
-conditional on `clickhouse-c` (at the vendored revision) holding the
+**Trusted base.** Soundness of every non-`unsafe` API is conditional on
+`clickhouse-c`, at the revision in `clickhouse-c/UPSTREAM`, holding the
 invariants its headers document — chiefly that the `chc_column`-side
-length counters (`n_rows`, `offsets.last()`, `name_len`, etc.) match
-the buffer the same struct points at. Where the cross-check is
-expressible in a line, `debug_assert!`s trip in debug builds; release
-builds trust the C side. Bounds against the underlying allocation are
-not checked because `clickhouse-c` exposes no buffer-capacity API.
+length counters (`n_rows`, `offsets.last()`, `name_len`) match the buffer
+the same struct points at. Where a length is available from two fields the
+smaller wins, so a C-side bug truncates rather than reading out of bounds;
+where only a `debug_assert!` is possible it trips in debug builds and
+release trusts the C side. `clickhouse_c::UPSTREAM_REVISION` reports the
+bundled revision at runtime.
+
+**Decoded blocks.** Decoding bounds every slice by the owning column's own
+row count, so the accessors are safe on any input, however forged.
+Agreement *between* columns — array offsets non-decreasing, LowCardinality
+keys inside the dictionary — is not checked, because the cost is
+proportional to row count and most readers never index by them. Code that
+does should call `Block::validate` first on anything a peer sent.
 
 **Allocators thread through every owning constructor.** `chc_alloc` is
 a vtable. `Allocator` wraps it `Copy + Send + Sync`. `TypeAst` /
@@ -135,13 +143,16 @@ new `chc_packet` member must be a union arm, never a parallel struct
 field: a field laid out past the union's offset reads zero for every
 packet, silently turning exception payloads into NULL.
 
-**Send / Sync.** Every owning handle is `Send`; none are `Sync`. Each
-`chc_client` is single-threaded upstream; block & builder objects
-follow. `Allocator` is the only `Sync` type (stateless function-pointer
-vtable). `AsyncClient` (feature `tokio`) is `Send` too, and its method
-futures stay `Send` because no raw FFI pointer is held across an
-`.await` — each `chc_async_*` call resolves the C-owned slice or pointer
-in a tight scope and awaits only on the copied `&[u8]`.
+**Send / Sync.** Every owning handle is `Send`. `Client`, `Block`,
+`TypeAst`, `Exception`, and the I/O backends are not `Sync`: each
+`chc_client` is single-threaded upstream and the rest follow. The
+exceptions are `Allocator` (a stateless function-pointer vtable) and
+`BlockBuilder` / `ColumnBuilder`, where a shared reference only exposes
+reads — which is what lets the async client hold a `&BlockBuilder` across
+the `send_data` await. `AsyncClient` is `Send`, and its method futures
+stay `Send` because no raw FFI pointer is held across an `.await`: each
+`chc_async_*` call resolves the C-owned slice or pointer in a tight scope
+and awaits only on the copied `&[u8]`.
 
 ## Quickstart
 
@@ -355,6 +366,21 @@ checkout with:
 ```sh
 CHC_INCLUDE_DIR=/abs/path/to/clickhouse-c cargo build
 ```
+
+## Supported platforms
+
+Unix only, and `build.rs` says so rather than failing in the C compiler.
+`PosixIo` is the bundled transport and it needs `poll(2)`; the block and
+client layers themselves are portable, so a Windows port is a matter of
+writing a Windows `Io` backend. CI runs Linux and macOS on x86-64 and
+aarch64.
+
+ClickHouse Native is little-endian on the wire. Offsets and
+LowCardinality keys are byte-swapped to host order at decode time; fixed
+column data is not, so a big-endian host swaps multi-byte scalars itself
+in both directions.
+
+MSRV is 1.85, checked in CI.
 
 ## Non-goals
 

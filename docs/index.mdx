@@ -1,0 +1,574 @@
+---
+sidebarTitle: 'clickhouse-c-rs'
+keywords: ['rust', 'native protocol', 'native format', 'ffi', 'bindings', 'tcp', 'block decode']
+slug: /integrations/rust/clickhouse-c-rs
+description: 'Low-level Rust bindings for clickhouse-c, the header-only C client for the ClickHouse native protocol.'
+title: 'clickhouse-c-rs'
+doc_type: 'reference'
+---
+
+`clickhouse-c-rs` is a low-level Rust binding for
+[`clickhouse-c`](/integrations/c), the header-only C client for the ClickHouse
+[native protocol](/concepts/features/interfaces/tcp). It bundles the C headers,
+so there is no system library to install and no submodule to check out.
+
+It inherits the C client's shape on purpose. Blocks in
+[Native](/reference/formats/Native) format go over an I/O backend you supply;
+you own the socket, the TLS context, the allocator, retries, and pooling. What
+Rust adds is ownership, lifetimes, and the destructor calls — not a layer of
+policy on top.
+
+<Note>
+This is not the general-purpose Rust client. For row structs, `serde`, async
+pooling, and an HTTP interface, use
+[`clickhouse-rs`](/integrations/rust). Reach for
+`clickhouse-c-rs` when you want the native wire format with a small dependency
+footprint, or a column-oriented view of a block without materializing rows.
+</Note>
+
+## What the library doesn't do {#non-goals}
+
+Deliberate non-goals, inherited from the C client. Handle them in your
+application:
+
+- HTTP protocol. Use an HTTP client directly for the
+  [HTTP interface](/concepts/features/interfaces/http).
+- Row structs, `serde`, and query builders. Blocks are exposed as columns.
+- DNS resolution, endpoint failover, connection pooling, retry, and backoff.
+- Insert batching policy, schema management, and migrations.
+- Threading. Each `Client` is single-threaded, matching upstream.
+
+## Installing {#installing}
+
+```toml
+[dependencies]
+clickhouse-c-rs = "0.1"
+```
+
+No features are on by default, so the base crate needs only a C compiler and
+libc. Unix only: `PosixIo` is the bundled transport and it needs `poll(2)`.
+The MSRV is 1.85.
+
+| Feature | Effect | Needs |
+|---|---|---|
+| `lz4` | `Codec::lz4()`, LZ4 frame compression | system `liblz4` |
+| `zstd` | `Codec::zstd()`, ZSTD frame compression | system `libzstd` |
+| `tokio` | `AsyncClient` over `tokio::net::TcpStream` | `tokio` |
+| `tls` | `tls::TlsIo` for the blocking client, `AsyncClient::connect_tls` | `rustls`, `webpki-roots`, `tokio-rustls` |
+
+The crate is organized in three layers:
+
+1. `clickhouse_c::sys` — the raw unsafe FFI. Every public function, struct, and
+   constant of the vendored headers, checked against them on every test run.
+   Anything the safe layer does not wrap is still reachable here.
+2. Safe primitives — `TypeAst`, `Block`, `BlockReader`, `BlockBuilder`,
+   `Client`, `Codec`, `Allocator`.
+3. Optional transport adapters — `PosixIo`, `AsyncClient`, `tls::TlsIo`, all on
+   the `Io` trait.
+
+`clickhouse_c::UPSTREAM_REVISION` reports which `clickhouse-c` revision the
+bundled headers came from.
+
+## Required server setting {#server-setting}
+
+The decoder reads printable type names from the wire, so they must be encoded
+as text. ClickHouse writes them as text by default, but pin the setting on your
+queries so a server or session profile that sets it to binary can't break
+decoding:
+
+```plaintext
+output_format_native_encode_types_in_binary_format = 0
+```
+
+`QuerySetting::TEXT_TYPE_NAMES` is that setting, ready to drop into a query's
+settings list.
+
+## Connecting over TCP {#connecting-over-tcp}
+
+You connect the socket; `Client::init` runs the Hello handshake on it. Take the
+`PosixIo` by ownership with `new_owned` and the client closes the fd on drop;
+`PosixIo::new(sock.as_fd())` borrows instead, and the resulting `Client<'_>`
+cannot outlive the socket.
+
+```rust
+use clickhouse_c::{Allocator, Client, ClientOpts, PosixIo};
+use std::net::TcpStream;
+
+let sock = TcpStream::connect("localhost:9000")?;
+sock.set_nodelay(true).ok();
+
+let opts = ClientOpts::new()
+    .user("default")
+    .password("")
+    .database("default")
+    .client_name("my-service");
+
+let mut client = Client::init(
+    &opts,
+    Allocator::stdlib(),
+    PosixIo::new_owned(sock),
+    None,                       // no codec: uncompressed
+)?;
+
+let info = client.server_info().expect("handshake completed");
+println!(
+    "connected to {} {}.{}.{}",
+    info.display_name, info.version_major, info.version_minor, info.version_patch
+);
+```
+
+`ClientOpts` also carries `client_version` and `client_revision`. The revision
+is the native protocol revision to negotiate; the server caps it at its own, so
+asking for a newer one is safe and asking for an older one turns off the
+features it gates.
+
+## Running a query {#running-a-query}
+
+Send the query, then drain events until `Event::EndOfStream`. Use
+`send_query_with` to attach settings and parameters; `send_query` is the bare
+form that sends an empty settings list.
+
+```rust
+use clickhouse_c::{Event, QueryOpts, QueryParam, QuerySetting};
+
+let settings = [
+    QuerySetting::TEXT_TYPE_NAMES,
+    QuerySetting::new("max_block_size", "8192"),
+    // `important` makes the server reject a setting it does not recognize
+    // instead of ignoring it.
+    QuerySetting::new("max_execution_time", "30").important(),
+];
+let params = [QueryParam::new("cutoff", "'100'")];
+
+client.send_query_with(
+    "SELECT number, toString(number * number) \
+     FROM numbers(1000) WHERE number > {cutoff:UInt64}",
+    &QueryOpts::new().settings(&settings).params(&params),
+)?;
+
+loop {
+    match client.recv_event()? {
+        Event::Data(block) => print_block(&block),
+        Event::Exception(exc) => return Err(exc.into()),
+        Event::EndOfStream => break,
+        _ => {}                       // Progress, ProfileInfo, Log, ...
+    }
+}
+```
+
+Parameter values are single-quoted whatever the placeholder's declared type:
+the server unquotes, then parses the text as that type. So `{n:UInt8}` takes
+`'42'`, not `42`.
+
+Server-side query errors are not `Err`. They arrive as `Event::Exception`,
+carrying the server's `code`, `display_text`, and `stack_trace`; `Err` is
+reserved for transport, protocol, and decode failures. `Exception` converts
+into the crate's `Error` with `.into()`, as above.
+
+The first `Event::Data` of a result is a header block describing the schema
+with zero rows; data blocks follow.
+
+## Reading column data {#reading-column-data}
+
+Blocks are column-oriented. Each column has a physical layout you dispatch on,
+and a declared type that says what the bytes mean. Composite layouts nest, so
+reading a `Nullable(Array(String))` means unwrapping the nullable, walking the
+array offsets, then slicing the string data.
+
+| Layout | Accessors |
+|---|---|
+| `ColumnLayout::Fixed` | `column.fixed()` → `(elem_size, bytes)`, `n_rows * elem_size` little-endian bytes |
+| `ColumnLayout::String` | `column.string()` → `(offsets, data)`; `offsets[i]` is row `i`'s exclusive end, host byte order, row 0 starts at 0 |
+| `ColumnLayout::Nullable` | `column.null_map()` (one byte per row, 1 = `NULL`), `column.nullable_inner()` |
+| `ColumnLayout::Array` | `column.array_offsets()` (cumulative ends), `column.array_values()`; `Map` decodes as `Array(Tuple(K, V))` |
+| `ColumnLayout::Tuple` | `column.tuple_arity()`, `column.tuple_child(i)`; every child has the same row count |
+| `ColumnLayout::LowCardinality` | `column.low_cardinality()` → `key_size` (1/2/4/8), `keys`, `dict` |
+
+A reader for numeric, string, and nullable columns:
+
+```rust
+use clickhouse_c::{Column, ColumnLayout, Kind, TypeRef};
+
+fn print_value(ty: TypeRef<'_>, col: Column<'_>, row: usize) {
+    if let Some(ColumnLayout::Nullable) = col.layout() {
+        if col.null_map().is_some_and(|m| m[row] == 1) {
+            print!("\\N");
+            return;
+        }
+        let (inner_ty, inner) = (ty.child(0), col.nullable_inner());
+        if let (Some(inner_ty), Some(inner)) = (inner_ty, inner) {
+            print_value(inner_ty, inner, row);
+        }
+        return;
+    }
+
+    match col.layout() {
+        Some(ColumnLayout::Fixed) => {
+            // A raw little-endian slab: slice the row out and convert, rather
+            // than casting the pointer, so alignment is never an issue.
+            let Some((elem_size, bytes)) = col.fixed() else { return };
+            let cell = &bytes[row * elem_size..][..elem_size];
+            match ty.kind() {
+                Some(Kind::UInt64) => {
+                    print!("{}", u64::from_le_bytes(cell.try_into().unwrap()))
+                }
+                Some(Kind::Int32) => {
+                    print!("{}", i32::from_le_bytes(cell.try_into().unwrap()))
+                }
+                Some(Kind::Float64) => {
+                    print!("{}", f64::from_le_bytes(cell.try_into().unwrap()))
+                }
+                _ => {}
+            }
+        }
+        Some(ColumnLayout::String) => {
+            let Some((offsets, data)) = col.string() else { return };
+            let start = if row == 0 { 0 } else { offsets[row - 1] as usize };
+            print!("{}", String::from_utf8_lossy(&data[start..offsets[row] as usize]));
+        }
+        _ => {}
+    }
+}
+```
+
+Fixed data is little-endian on the wire; on a big-endian host you byte-swap
+multi-byte scalars yourself. Offsets and LowCardinality keys are already
+swapped to host order at decode time. UUIDs are two little-endian `UInt64`
+halves, IPv4 is a 4-byte little-endian integer, IPv6 is network byte order, and
+`DateTime64` ticks are UTC — the timezone in the type is metadata only.
+
+Server-controlled text — column names, enum names, timezones, exception
+messages — is returned as `&[u8]` rather than `&str`, so the UTF-8 question
+stays with you.
+
+<Warning>
+Decoding bounds every slice by the owning column's own row count, so these
+accessors are safe on any input. Agreement *between* columns — array offsets
+non-decreasing, LowCardinality keys inside the dictionary — is not checked.
+Call `Block::validate` before walking a block from an untrusted peer using
+those offsets or keys as indices.
+</Warning>
+
+## Inserting data {#inserting-data}
+
+`ColumnBuilder` mirrors the C `chc_build_*` constructors: leaves (`fixed`,
+`string`) compose with wrappers (`nullable`, `array`, `low_cardinality`,
+`tuple`) into a tree matching any composite the reader emits. Nothing is
+copied. The nodes point into storage you own, so the borrow checker holds that
+storage in place until the write completes.
+
+An INSERT sends the query, waits for the server's header block, sends one or
+more data blocks, then sends an empty block to terminate the stream.
+
+```rust
+use clickhouse_c::{BlockBuilder, ColumnBuilder, Event, QueryOpts, TypeAst};
+
+client.send_query_with("INSERT INTO greetings (id, message) VALUES", &QueryOpts::new())?;
+
+// Wait for the header block: schema, zero rows.
+loop {
+    match client.recv_event()? {
+        Event::Data(_) => break,
+        Event::Exception(exc) => return Err(exc.into()),
+        Event::EndOfStream => return Err("no header block".into()),
+        _ => {}
+    }
+}
+
+let alloc = Allocator::stdlib();
+let u64_ty = TypeAst::parse("UInt64", alloc)?;
+let str_ty = TypeAst::parse("String", alloc)?;
+
+let ids: Vec<u8> = [1u64, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+let id = ColumnBuilder::fixed(&ids, 8, 3)?;
+
+// String columns: cumulative exclusive end offsets over a packed slab.
+let offsets = [5u64, 11, 20];
+let bytes = b"hellobuenasgoedendag";
+let message = ColumnBuilder::string(&offsets, bytes, 3)?;
+
+let mut block = BlockBuilder::new();
+block.append("id", u64_ty.view(), &id)?;
+block.append("message", str_ty.view(), &message)?;
+
+client.send_data(Some(&block))?;   // the populated block
+client.send_data(None)?;           // empty block ends the INSERT
+
+loop {
+    match client.recv_event()? {
+        Event::EndOfStream => break,
+        Event::Exception(exc) => return Err(exc.into()),
+        _ => {}
+    }
+}
+```
+
+Every column in a block shares one top-level row count, and `append` rejects a
+mismatch. `ColumnBuilder` checks what it can before C sees it — exact offset
+lengths, monotonic offsets, LowCardinality key width and range, slabs long
+enough for the row count — and the C writer checks the tree against the parsed
+type.
+
+Nest for composites. `Array(Nullable(UInt32))`:
+
+```rust
+let leaf = ColumnBuilder::fixed(&values, 4, 4)?;
+let nullable = leaf.nullable(&null_map)?;          // borrows leaf
+let array = nullable.array(&array_offsets, 3)?;    // borrows nullable
+block.append("v", array_ty.view(), &array)?;       // borrows array until the write
+```
+
+`Map(K, V)` is `Array(Tuple(K, V))`, and the geo types are tuples of tuples, so
+the same four constructors cover them.
+
+## Reading Native without a server {#native-without-a-server}
+
+`BlockReader` and `BlockBuilder::write` work on any `Io` backend, with no TCP
+packet loop. Piping `clickhouse local` is the usual case:
+
+```rust
+use clickhouse_c::{Allocator, BlockOpts, BlockReader, PosixIo};
+use std::os::fd::AsFd;
+use std::process::{Command, Stdio};
+
+let mut child = Command::new("clickhouse")
+    .args(["local", "--format", "Native",
+           "--output_format_native_encode_types_in_binary_format=0",
+           "-q", "SELECT number FROM numbers(5)"])
+    .stdout(Stdio::piped())
+    .spawn()?;
+let stdout = child.stdout.take().expect("piped");
+let mut io = PosixIo::new(stdout.as_fd());
+
+// One reader across every read: bytes pulled past a block boundary stay
+// buffered, so a multi-block result decodes without dropping the tail.
+let mut reader = BlockReader::new(io.as_mut(), Allocator::stdlib(), BlockOpts::default())?;
+while let Some(block) = reader.read()? {
+    print_block(&block);
+}
+```
+
+`BlockOpts` says which optional prefixes the frames carry. `clickhouse local`
+writes neither, so the default is right; the TCP path sets them from the
+negotiated server revision, which `Client` handles for you.
+
+## Custom transports {#custom-transports}
+
+`Io` is the one trait behind `Client`, `BlockReader`, and
+`BlockBuilder::write`, so a backend written once serves all three. Implement it
+for an OpenSSL `SSL`, an `io_uring` ring, an in-memory buffer, or anything else
+that can move bytes.
+
+```rust
+use clickhouse_c::{sys, Io};
+use core::pin::Pin;
+
+unsafe impl Io for MyTransport {
+    fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
+        // SAFETY: returns the address of an inline field; never moves self.
+        unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
+    }
+}
+```
+
+The trait is `unsafe` because the pointer goes straight to C. The vtable must
+stay at a fixed address for as long as the borrow lives, which is why backends
+are built behind `Pin<Box<Self>>`; `read` fills up to `len` bytes and reports
+the count, with 0 meaning clean EOF; `write` writes all `len` bytes or fails.
+`tests/custom_io.rs` in the repository is a complete worked backend.
+
+## Compression {#compression}
+
+Pass a `Compression` mode and a matching `Codec`. The client decompresses
+incoming Data packets and compresses outgoing ones. Each `Codec` constructor
+fills only its own slots, so a codec supporting both modes is built by hand.
+
+```rust
+use clickhouse_c::{Client, ClientOpts, Codec, Compression};
+
+let opts = ClientOpts::new().user("default").compression(Compression::Lz4);
+let client = Client::init(&opts, Allocator::stdlib(), io, Some(Codec::lz4()))?;
+```
+
+`Client::init` rejects a compression mode the codec cannot do, rather than
+reaching a null call mid-frame. For a compression library the crate ships no
+binding for, `Codec::empty()` plus the `unsafe` `Codec::raw_mut()`, or
+`Codec::from_raw()`, install your own callbacks; both are available with no
+features enabled.
+
+## TLS {#tls}
+
+The `tls` feature adds a [rustls](https://github.com/rustls/rustls) backend for
+both clients. `rustls` is re-exported as `clickhouse_c::tls::rustls` so you can
+pin one version and build a bespoke `ClientConfig` for a private CA or mTLS.
+[ClickHouse Cloud](/products/cloud/getting-started/intro) and other TLS-enabled
+deployments use the native protocol on port 9440.
+
+```rust
+use clickhouse_c::{Allocator, Client, ClientOpts, tls};
+use std::net::TcpStream;
+
+let tcp = TcpStream::connect(("myhost.clickhouse.cloud", 9440))?;
+tcp.set_nodelay(true).ok();
+
+// Verifies the chain and the SNI hostname against the Mozilla webpki roots.
+let io = tls::TlsIo::connect(tcp, "myhost.clickhouse.cloud", tls::default_config())?;
+let mut client = Client::init(
+    &ClientOpts::new().user("default").password("…"),
+    Allocator::stdlib(),
+    io,
+    None,
+)?;
+```
+
+`TlsIo::connect` drives the handshake to completion, so certificate, SNI, and
+verification errors surface there rather than on the first query.
+
+## Async client {#async-client}
+
+The `tokio` feature adds `AsyncClient` over the C library's ioless protocol
+machine. There is no worker thread and no blocking call: the caller's task
+submits inbound bytes and drains outbound ones. Its method futures are `Send`,
+so `tokio::spawn` on a multi-thread runtime accepts them.
+
+```rust
+use clickhouse_c::{AsyncClient, ClientOpts, Event};
+
+let mut client = AsyncClient::connect(
+    ("127.0.0.1", 9000),
+    ClientOpts::new().user("default"),
+    None,
+).await?;
+
+client.send_query("SELECT number FROM numbers(5)", None).await?;
+loop {
+    match client.recv_event().await? {
+        Event::Data(block) => print_block(&block),
+        Event::Exception(exc) => return Err(exc.into()),
+        Event::EndOfStream => break,
+        _ => {}
+    }
+}
+```
+
+Under TLS, `AsyncClient::connect_tls` takes the SNI hostname and an
+`Arc<rustls::ClientConfig>`.
+
+<Note>
+`clickhouse-c` publishes no `chc_async_send_query_ex`, so the async client has
+no counterpart to `send_query_with`: per-query settings and parameters are
+reachable from the blocking client only. Put required settings in the SQL text
+or on the server profile until upstream adds one.
+</Note>
+
+To drive the protocol from a runtime other than tokio — `async-std`, `smol`,
+`io_uring`, an embedded event loop — the `chc_async_*` functions are all
+declared in `clickhouse_c::sys`.
+
+## Cancellation {#cancellation}
+
+Two separate things, often wanted together:
+
+```rust
+use clickhouse_c::{CancelToken, PosixIo};
+
+let cancel = CancelToken::new();
+let io = PosixIo::new_owned_cancellable(sock, cancel.clone());
+// ... from another task or thread:
+cancel.cancel();
+```
+
+`CancelToken` fails local reads with `ErrorKind::Cancelled` and sends nothing.
+`clickhouse-c` checks it before each transport read, not during one, so pair it
+with `PosixIo::set_read_timeout` to bound a read already parked in `read(2)`.
+
+`Client::send_cancel` is the other half: it sends the protocol Cancel packet so
+the server stops producing rows. Packets already in flight still arrive, so
+keep draining to `EndOfStream`.
+
+## Memory and the allocator {#allocator}
+
+Every owning handle carries the `Allocator` it was built with and frees through
+it on drop, so allocation rides on whatever scheme the host uses.
+`Allocator::stdlib()` is `malloc`-backed. `Allocator::global` bridges any
+`GlobalAlloc`:
+
+```rust
+use clickhouse_c::Allocator;
+
+static ARENA: MyAllocator = MyAllocator::new();
+let alloc = Allocator::global(&ARENA);
+```
+
+The reference travels through the C vtable's `ud` slot, so it must outlive
+every object parsed through it — hence `&'static`.
+
+## Errors and server exceptions {#errors}
+
+`Error` carries an `ErrorKind`, a message copied out of the C `chc_err` buffer,
+and, for a server exception, the ClickHouse error code and exception class.
+
+| Kind | Meaning |
+|---|---|
+| `Io` | transport failure, or a read deadline elapsed |
+| `Eof` | stream ended where more bytes were required |
+| `Protocol` | wire bytes did not parse |
+| `Type` | a type name did not parse, or a column did not match its type |
+| `Oom` | the allocator returned null |
+| `Cancelled` | a `CancelToken` was set before this read |
+| `Server` | the server sent an exception |
+| `Usage` | the caller broke an API contract |
+| `WouldBlock` | the ioless client needs more submitted bytes |
+
+Errors the caller can prevent are reported as `Usage` before anything reaches
+the wire: mismatched row counts, a codec that cannot do the selected
+compression, an interior NUL in a user name or a setting value.
+
+## Supported data types {#supported-types}
+
+The block reader decodes:
+
+- `Int8`–`Int256`, `UInt8`–`UInt256`
+- `Float32`, `Float64`, `BFloat16`
+- `Bool`
+- `Decimal32`, `Decimal64`, `Decimal128`, `Decimal256`
+- `Date`, `Date32`, `DateTime`, `DateTime64`, `Time`, `Time64`
+- `String`, `FixedString(N)`
+- `UUID`, `IPv4`, `IPv6`
+- `Enum8`, `Enum16`
+- `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`, `Nested(...)`
+- `LowCardinality(T)`
+- `Interval`
+- `QBit(T, N)`, as a tuple of `N`-bit-wide bit-plane columns, MSB plane first
+- `Point`, `Ring`, `Polygon`, `MultiPolygon`
+- `SimpleAggregateFunction(f, T)`, which decodes as its inner `T`
+- `JSON` and `Object('json')`, as `String` columns under string serialization
+
+`JSON` and `Object('json')` need `output_format_native_write_json_as_string=1`
+on the query; each row then arrives as one JSON document in a
+`ColumnLayout::String` column, and `ColumnBuilder::string` writes the same
+shape back.
+
+`Variant`, `Dynamic`, and `AggregateFunction` are not decoded and return
+`ErrorKind::Type`; cast them to `String` server-side as a fallback.
+
+Type metadata is available without decoding a block: `TypeAst::parse` parses a
+type name, and `TypeRef` exposes the kind, children, tuple field names, enum
+entries, decimal precision and scale, `DateTime64` scale, timezone, and QBit
+dimension.
+
+## Raw FFI {#raw-ffi}
+
+`clickhouse_c::sys` declares the full public surface of the vendored headers.
+Anything the safe layer does not cover is reachable there, at the cost of
+`unsafe`. Two guards keep it honest, both running as ordinary tests: one
+compares the declared functions and enumerators against the headers in both
+directions, the other compares every struct's `size`, `align`, and field
+offsets against a C translation unit compiled from the same headers. An
+upstream bump that changes either fails the build rather than corrupting memory
+at the boundary.
+
+`clickhouse-openssl.h` is shipped but not bound, for callers wiring their own
+OpenSSL `chc_io`. To build against an out-of-tree `clickhouse-c` checkout
+instead of the bundled headers, set `CHC_INCLUDE_DIR`; the parity and layout
+tests then run against that checkout.
