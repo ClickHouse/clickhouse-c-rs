@@ -14,6 +14,8 @@
 //! * With feature `tokio`, [`AsyncClient`] over `tokio::net::TcpStream`:
 //!   same packet loop, driven by the caller's task without a worker
 //!   thread.
+//! * With feature `tls`, TLS over rustls: the blocking [`Client`] on a
+//!   [`tls::TlsIo`] backend, and [`AsyncClient::connect_tls`].
 //!
 //! [`sys`] holds the raw unsafe FFI surface the safe layer wraps.
 //!
@@ -34,6 +36,8 @@ mod client;
 mod codec;
 mod error;
 mod io;
+#[cfg(feature = "tls")]
+pub mod tls;
 mod types;
 
 pub use alloc::Allocator;
