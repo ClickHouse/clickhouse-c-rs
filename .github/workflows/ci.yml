@@ -93,6 +93,31 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The C boundary is where a Rust-side mistake stops being a compile error,
+  # so the malformed-input sweep and the live tests run instrumented.
+  sanitizer:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    env:
+      CFLAGS: -fsanitize=address -fno-omit-frame-pointer -g
+      RUSTFLAGS: -D warnings -Zsanitizer=address
+      # ASan aborts where malloc would return null. A corrupt length field is
+      # meant to reach the library's OOM path, not stop the run.
+      ASAN_OPTIONS: detect_leaks=0:allocator_may_return_null=1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+      - run: sudo apt-get update && sudo apt-get install -y liblz4-dev libzstd-dev
+      - run: curl https://clickhouse.com/ | sh && sudo ./clickhouse install --noninteractive
+      # No TLS: aws-lc-rs ships its own assembly and is not the boundary under
+      # test. An explicit --target keeps build scripts uninstrumented.
+      - run: >
+          cargo test --features tokio --target x86_64-unknown-linux-gnu
+          --lib --tests -- --test-threads=1
+
   package:
     name: Packaged crate
     runs-on: ubuntu-latest

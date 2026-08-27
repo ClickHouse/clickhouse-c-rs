@@ -12,8 +12,9 @@
 //!    [`Allocator`]. Ownership, lifetimes, and the C destroy calls, and
 //!    nothing else: no pooling, no retries, no row mapping.
 //! 3. Optional transport adapters — [`PosixIo`] always, [`AsyncClient`]
-//!    under feature `tokio`, [`tls`] under feature `tls`. All three sit on
-//!    the [`Io`] trait, which a consumer can implement for any transport.
+//!    under feature `tokio`, [`tls`] under feature `tls`. The blocking ones
+//!    sit on the [`Io`] trait, which a consumer can implement for any
+//!    transport; the async one is a byte pump over [`IolessClient`].
 //!
 //! # Entry points
 //!
@@ -25,9 +26,12 @@
 //! * [`Client`] over a connected TCP [`PosixIo`]: full Hello / Query /
 //!   Data / EOS / Exception / Progress packet loop with optional LZ4 /
 //!   ZSTD compression.
+//! * [`IolessClient`]: the same packet loop with no I/O in it at all. The
+//!   caller submits inbound bytes and drains outbound ones, so any runtime
+//!   or event loop can drive it.
 //! * With feature `tokio`, [`AsyncClient`] over `tokio::net::TcpStream`:
-//!   same packet loop, driven by the caller's task without a worker
-//!   thread.
+//!   [`IolessClient`] plus a byte pump, driven by the caller's task without
+//!   a worker thread.
 //! * With feature `tls`, TLS over rustls: the blocking [`Client`] on a
 //!   [`tls::TlsIo`] backend, and [`AsyncClient::connect_tls`].
 //!
@@ -75,6 +79,7 @@ mod client;
 mod codec;
 mod error;
 mod io;
+mod ioless;
 #[cfg(test)]
 mod parity;
 mod query;
@@ -93,5 +98,6 @@ pub use client::{
 pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};
 pub use io::{CancelToken, Io, PosixIo};
+pub use ioless::{IolessClient, Step};
 pub use query::{QueryOpts, QueryParam, QuerySetting};
 pub use types::{Kind, TypeAst, TypeRef};

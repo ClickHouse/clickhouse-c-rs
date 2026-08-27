@@ -206,7 +206,12 @@ pub struct BlockReader<'io, I: Io + ?Sized> {
     // Keeps the pinned backend borrowed & fixed: `raw` holds a chc_io pointer
     // into it for the reader's lifetime.
     _io: Pin<&'io mut I>,
-    alloc: Allocator,
+    // chc_in_init stashes `in->al = al`, so the C side keeps calling through
+    // this exact address on every refill and on free. Boxed to give it one
+    // that outlives the constructor and survives moves of `Self`, as
+    // `Client` does for the same reason. Passing `&alloc` of a by-value
+    // parameter instead leaves C reading a dead stack slot.
+    alloc: Box<Allocator>,
     opts: sys::chc_block_opts,
 }
 
@@ -215,6 +220,8 @@ impl<'io, I: Io + ?Sized> BlockReader<'io, I> {
     /// (`BlockOpts::default()` for `clickhouse local`).
     pub fn new(mut io: Pin<&'io mut I>, alloc: Allocator, opts: BlockOpts) -> Result<Self> {
         let raw_opts = opts.to_raw();
+        // Box before handing the address to C: the reader retains it.
+        let alloc = Box::new(alloc);
         let mut raw: *mut sys::chc_in = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
@@ -253,7 +260,7 @@ impl<'io, I: Io + ?Sized> BlockReader<'io, I> {
         check(rc, &err)?;
         Ok(NonNull::new(out).map(|raw| Block {
             raw,
-            alloc: self.alloc,
+            alloc: *self.alloc,
         }))
     }
 }

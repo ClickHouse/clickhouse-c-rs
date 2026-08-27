@@ -63,8 +63,9 @@ The crate is organized in three layers:
    Anything the safe layer does not wrap is still reachable here.
 2. Safe primitives — `TypeAst`, `Block`, `BlockReader`, `BlockBuilder`,
    `Client`, `Codec`, `Allocator`.
-3. Optional transport adapters — `PosixIo`, `AsyncClient`, `tls::TlsIo`, all on
-   the `Io` trait.
+3. Optional transport adapters — `PosixIo`, `AsyncClient`, `tls::TlsIo`. The
+   blocking ones sit on the `Io` trait; the async one is a byte pump over
+   `IolessClient`, which is the protocol with no I/O in it.
 
 `clickhouse_c::UPSTREAM_REVISION` reports which `clickhouse-c` revision the
 bundled headers came from.
@@ -461,9 +462,55 @@ reachable from the blocking client only. Put required settings in the SQL text
 or on the server profile until upstream adds one.
 </Note>
 
-To drive the protocol from a runtime other than tokio — `async-std`, `smol`,
-`io_uring`, an embedded event loop — the `chc_async_*` functions are all
-declared in `clickhouse_c::sys`.
+## Any other runtime {#ioless}
+
+`AsyncClient` is a byte pump over `IolessClient`, which is the whole protocol
+with no I/O in it. Submit the bytes you received, drain the bytes it wants
+sent, and drive `async-std`, `smol`, `io_uring`, or an embedded event loop
+yourself. Nothing below needs `tokio`, `sys`, or `unsafe`.
+
+Every step that could run past the submitted bytes returns `Step::NeedsInput`
+instead of blocking, and resumes mid-block once more arrive.
+
+```rust
+use clickhouse_c::{Allocator, ClientOpts, Event, IolessClient, Step};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+
+let mut sock = TcpStream::connect("localhost:9000")?;
+let mut core = IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None)?;
+let mut buf = [0u8; 8192];
+
+// Push everything queued, then read once. Flushing before the read is not
+// optional: a step that reports NeedsInput has usually just queued the bytes
+// the server is waiting on, and reading first deadlocks both sides.
+let mut pump = |core: &mut IolessClient, sock: &mut TcpStream| -> clickhouse_c::Result<()> {
+    while !core.pending_out().is_empty() {
+        let n = sock.write(core.pending_out())?;
+        core.consume_out(n);
+    }
+    let n = sock.read(&mut buf)?;
+    core.submit(&buf[..n])
+};
+
+while !core.handshake()?.is_ready() {
+    pump(&mut core, &mut sock)?;
+}
+
+core.send_query("SELECT number FROM numbers(5)", None)?;
+loop {
+    match core.recv_event()? {
+        Step::Ready(Event::EndOfStream) => break,
+        Step::Ready(Event::Data(block)) => print_block(&block),
+        Step::Ready(_) => {}
+        Step::NeedsInput => pump(&mut core, &mut sock)?,
+    }
+}
+```
+
+A partial write is fine: `consume_out` takes whatever the transport accepted.
+Sends never block or apply backpressure, so watch `pending_out().len()` and
+stop issuing sends when it grows past what you are willing to buffer.
 
 ## Cancellation {#cancellation}
 

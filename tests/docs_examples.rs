@@ -272,6 +272,44 @@ async fn async_client() -> DocResult {
     Ok(())
 }
 
+// ---- Any other runtime ---------------------------------------------------
+
+fn ioless_over_a_blocking_socket() -> DocResult {
+    use clickhouse_c::{IolessClient, Step};
+    use std::io::{Read, Write};
+
+    let mut sock = TcpStream::connect("localhost:9000")?;
+    let mut core = IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None)?;
+    let mut buf = [0u8; 8192];
+
+    // Push everything queued, then read once. Flushing before the read is not
+    // optional: a step that reports NeedsInput has usually just queued the
+    // bytes the server is waiting on, and reading first deadlocks both sides.
+    let mut pump = |core: &mut IolessClient, sock: &mut TcpStream| -> clickhouse_c::Result<()> {
+        while !core.pending_out().is_empty() {
+            let n = sock.write(core.pending_out())?;
+            core.consume_out(n);
+        }
+        let n = sock.read(&mut buf)?;
+        core.submit(&buf[..n])
+    };
+
+    while !core.handshake()?.is_ready() {
+        pump(&mut core, &mut sock)?;
+    }
+
+    core.send_query("SELECT number FROM numbers(5)", None)?;
+    loop {
+        match core.recv_event()? {
+            Step::Ready(Event::EndOfStream) => break,
+            Step::Ready(Event::Data(block)) => print_block(&block),
+            Step::Ready(_) => {}
+            Step::NeedsInput => pump(&mut core, &mut sock)?,
+        }
+    }
+    Ok(())
+}
+
 // ---- Cancellation --------------------------------------------------------
 
 fn cancellation(sock: TcpStream) {

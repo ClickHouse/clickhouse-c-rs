@@ -7,7 +7,10 @@ ClickHouse Native wire format. Two entry points:
   (`PosixIo` covers a TCP socket or a pipe to `clickhouse local`)
 - TCP packet loop (Hello / Query / Data / EOS / Exception / Progress)
   with optional LZ4 / ZSTD compression
-- Tokio async TCP packet loop with feature `tokio`
+- `IolessClient`, the packet loop with no I/O in it: submit inbound
+  bytes, drain outbound ones, drive any runtime yourself
+- Tokio async TCP packet loop with feature `tokio`, a byte pump over
+  `IolessClient`
 - TLS (rustls) for both the blocking and async clients with feature `tls`
 
 [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
@@ -367,6 +370,32 @@ checkout with:
 CHC_INCLUDE_DIR=/abs/path/to/clickhouse-c cargo build
 ```
 
+## Testing
+
+`cargo test` runs everything; tests needing a live server skip themselves
+when `clickhouse` is not on PATH. Beyond the usual unit and round-trip
+coverage:
+
+- `tests/layout.rs` compares every `#[repr(C)]` mirror against a C
+  translation unit built from the same headers
+- `src/parity.rs` compares the declared symbols and enumerators against
+  the headers in both directions
+- `tests/malformed.rs` takes a valid block and truncates it at every
+  length, corrupts every byte four ways, and throws seeded random
+  mutations and pure garbage at both the block reader and the packet
+  parser
+- `tests/custom_io.rs` and `tests/ioless.rs` drive the crate the way a
+  third party would, through the public traits only
+
+CI runs that under AddressSanitizer with the C compiled `-fsanitize=address`:
+
+```sh
+CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+RUSTFLAGS="-Zsanitizer=address" \
+ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 \
+cargo +nightly test --features tokio --target x86_64-unknown-linux-gnu --lib --tests
+```
+
 ## Supported platforms
 
 Unix only, and `build.rs` says so rather than failing in the C compiler.
@@ -395,8 +424,9 @@ Mirrors upstream's list plus Rust-specific items:
   (`clickhouse-openssl.h`) or hand `connect_tls` a bespoke
   `rustls::ClientConfig`
 - Threading — each `Client` is single-threaded, matching upstream
-- Runtime-neutral Rust async — `AsyncClient` is Tokio-native; custom
-  event loops can drive `chc_async_*` through `sys`
+- Runtimes other than Tokio — no adapter ships for them, but
+  `IolessClient` is the whole protocol with no I/O, so writing one needs
+  no `unsafe` and no `sys`
 - `Variant` / `Dynamic` / `JSON` / `AggregateFunction` decoding —
   upstream excludes from v1 (25.x / 26.x wire format still shifting).
   A `ColumnBuilder::string` column under a `JSON` type covers the
