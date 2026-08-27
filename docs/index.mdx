@@ -9,8 +9,9 @@ doc_type: 'reference'
 
 `clickhouse-c-rs` is a low-level Rust binding for
 [`clickhouse-c`](/integrations/c), the header-only C client for the ClickHouse
-[native protocol](/concepts/features/interfaces/tcp). It bundles the C headers,
-so there is no system library to install and no submodule to check out.
+[native protocol](/concepts/features/interfaces/tcp). The published crate
+carries the C headers, so there is nothing to vendor and no system library to
+install beyond an optional compression library.
 
 It inherits the C client's shape on purpose. Blocks in
 [Native](/reference/formats/Native) format go over an I/O backend you supply;
@@ -45,16 +46,20 @@ application:
 clickhouse-c-rs = "0.1"
 ```
 
-No features are on by default, so the base crate needs only a C compiler and
-libc. Unix only: `PosixIo` is the bundled transport and it needs `poll(2)`.
-The MSRV is 1.85.
+Unix only: `PosixIo` is the bundled transport and it needs `poll(2)`. The MSRV
+is 1.85.
 
-| Feature | Effect | Needs |
-|---|---|---|
-| `lz4` | `Codec::lz4()`, LZ4 frame compression | system `liblz4` |
-| `zstd` | `Codec::zstd()`, ZSTD frame compression | system `libzstd` |
-| `tokio` | `AsyncClient` over `tokio::net::TcpStream` | `tokio` |
-| `tls` | `tls::TlsIo` for the blocking client, `AsyncClient::connect_tls` | `rustls`, `webpki-roots`, `tokio-rustls` |
+| Feature | Default | Effect | Needs |
+|---|---|---|---|
+| `lz4` | on | `Codec::lz4()`, LZ4 frame compression | system `liblz4` |
+| `zstd` | off | `Codec::zstd()`, ZSTD frame compression | system `libzstd` |
+| `tokio` | off | `AsyncClient` over `tokio::net::TcpStream` | `tokio` |
+| `tls` | off | `tls::TlsIo` for the blocking client, `AsyncClient::connect_tls` | `rustls`, `webpki-roots`, `tokio-rustls` |
+
+The compression features link system libraries, so an enabled one needs its
+development package present. `default-features = false` gives a build needing only a C
+compiler and libc; `Codec::empty()` and `Codec::from_raw()` stay available
+there for a caller-supplied codec.
 
 The crate is organized in three layers:
 

@@ -9,7 +9,14 @@ use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Held for a server's whole life. Test binaries run their tests in parallel
+/// threads, and several ClickHouse servers racing to start on one machine is
+/// how "did not become ready" flakes appear; one at a time costs a second per
+/// test and removes the class.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -24,6 +31,8 @@ pub fn clickhouse_on_path() -> bool {
 }
 
 pub struct ChServer {
+    // Declared first so it is released last, after the child is reaped.
+    _slot: MutexGuard<'static, ()>,
     child: Child,
     pub tcp_port: u16,
     /// Set only when spawned with a certificate.
@@ -47,6 +56,8 @@ impl ChServer {
     }
 
     fn start(tls: Option<(&Path, &Path)>, extra: &[&str]) -> TestResult<Self> {
+        // A panicking test poisons the lock; the next one still wants a server.
+        let slot = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir()?;
         let data_dir = tmp.path().join("ch");
         let log_dir = tmp.path().join("ch-logs");
@@ -98,6 +109,7 @@ impl ChServer {
         }
 
         let server = Self {
+            _slot: slot,
             child: cmd.spawn()?,
             tcp_port,
             secure_port,

@@ -18,9 +18,10 @@ include = [
     "/build.rs",
     "/Cargo.toml",
     "/LICENSE",
+    "/CHANGELOG.md",
     "/README.md",
+    "/UPSTREAM",
     "/clickhouse-c/LICENSE",
-    "/clickhouse-c/UPSTREAM",
     "/clickhouse-c/*.h",
     "/examples/*.rs",
     "/src/*.c",
@@ -32,11 +33,12 @@ include = [
 name = "clickhouse_c"
 path = "src/lib.rs"
 
-# Empty by default: the base crate needs only a C compiler and libc, matching
-# what `#include "clickhouse.h"` alone costs in C. `lz4` and `zstd` each link a
-# system library, so they are opt-in.
+# Servers negotiate LZ4 in practice, so the common build wants it and it stays
+# on by default; it links the system liblz4. `default-features = false` drops
+# to a build needing only a C compiler and libc, matching what
+# `#include "clickhouse.h"` alone costs in C.
 [features]
-default = []
+default = ["lz4"]
 lz4 = []
 tls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
 tokio = ["dep:tokio"]

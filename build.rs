@@ -23,12 +23,15 @@ fn main() {
 
     if !chc_dir.join("clickhouse.h").exists() {
         panic!(
-            "clickhouse.h not found under {}. Set CHC_INCLUDE_DIR to your clickhouse-c checkout.",
+            "clickhouse.h not found under {}. clickhouse-c is a git submodule: run \
+             `git submodule update --init`. Published crate archives carry the headers \
+             already, so this only bites in a fresh clone. Set CHC_INCLUDE_DIR to build \
+             against a checkout elsewhere.",
             chc_dir.display()
         );
     }
 
-    emit_upstream_revision(&chc_dir);
+    emit_upstream_revision(&manifest);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     generate_constants(&chc_dir, &out_dir);
@@ -99,10 +102,12 @@ fn probe(pkg: &str, link_name: &str) -> Vec<PathBuf> {
     }
 }
 
-/// Publish the bundled upstream revision so the crate can report which
-/// clickhouse-c its bindings were written against.
-fn emit_upstream_revision(chc_dir: &Path) {
-    let path = chc_dir.join("UPSTREAM");
+/// Publish the pinned upstream revision so the crate can report which
+/// clickhouse-c its bindings were written against. Read from a plain file
+/// rather than the submodule gitlink, because a published archive has no git;
+/// CI checks the two agree.
+fn emit_upstream_revision(manifest: &Path) {
+    let path = manifest.join("UPSTREAM");
     let revision = fs::read_to_string(&path)
         .ok()
         .and_then(|s| {

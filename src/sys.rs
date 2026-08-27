@@ -191,7 +191,6 @@ unsafe extern "C" {
     pub fn chc_type_decimal_precision(t: *const chc_type) -> c_int;
     pub fn chc_type_decimal_scale(t: *const chc_type) -> c_int;
     pub fn chc_type_datetime64_scale(t: *const chc_type) -> c_int;
-    // QBit(T, N): N. Element width in bits (16/32/64). 0 on non-QBit types.
     pub fn chc_type_qbit_dimension(t: *const chc_type) -> usize;
     pub fn chc_type_qbit_element_size(t: *const chc_type) -> usize;
     pub fn chc_type_timezone(t: *const chc_type, out_len: *mut usize) -> *const c_char;

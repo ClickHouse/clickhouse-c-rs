@@ -668,26 +668,29 @@ impl ProfileInfo {
 #[cfg(test)]
 mod tests {
     use super::ClientOpts;
-    use crate::{Codec, Compression, ErrorKind};
+    use crate::{Compression, ErrorKind};
+
+    /// Without a codec feature there is no built-in codec to mismatch, so
+    /// only the missing-codec half is reachable.
+    #[test]
+    fn compression_without_a_codec_is_a_usage_error() {
+        let err = ClientOpts::new()
+            .compression(Compression::Lz4)
+            .validate_codec(None)
+            .expect_err("missing codec");
+        assert_eq!(err.kind, ErrorKind::Usage);
+    }
 
     #[cfg(feature = "lz4")]
     #[test]
     fn compression_requires_matching_codec() {
-        let missing = ClientOpts {
-            compression: Compression::Lz4,
-            ..ClientOpts::new()
-        }
-        .validate_codec(None)
-        .expect_err("missing codec");
-        assert_eq!(missing.kind, ErrorKind::Usage);
+        use crate::Codec;
 
         let codec = Codec::lz4();
-        let mismatch = ClientOpts {
-            compression: Compression::Zstd,
-            ..ClientOpts::new()
-        }
-        .validate_codec(Some(codec.as_ref()))
-        .expect_err("mismatched codec");
+        let mismatch = ClientOpts::new()
+            .compression(Compression::Zstd)
+            .validate_codec(Some(codec.as_ref()))
+            .expect_err("mismatched codec");
         assert_eq!(mismatch.kind, ErrorKind::Usage);
     }
 }

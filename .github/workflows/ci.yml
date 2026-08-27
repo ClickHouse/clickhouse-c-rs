@@ -40,6 +40,8 @@ jobs:
             features: --all-features
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -63,6 +65,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
       - name: Read rust-version from the manifest
         id: msrv
         run: |
@@ -82,6 +86,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -106,6 +112,8 @@ jobs:
       ASAN_OPTIONS: detect_leaks=0:allocator_may_return_null=1
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -123,6 +131,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y liblz4-dev libzstd-dev
@@ -130,6 +140,15 @@ jobs:
       # carries every header and C shim the build needs. Extracting and
       # building again outside the repository proves nothing leaks in from the
       # surrounding checkout.
+      - name: UPSTREAM matches the submodule gitlink
+        run: |
+          set -euo pipefail
+          pinned=$(sed -n 's/^revision *= *//p' UPSTREAM)
+          actual=$(git -C clickhouse-c rev-parse HEAD)
+          test "$pinned" = "$actual" \
+            || { echo "UPSTREAM says $pinned, submodule is at $actual"; exit 1; }
+      # Walks the initialized submodule, so this is also what proves the
+      # archive is not missing the headers.
       - run: cargo package --all-features
       - name: Build the extracted archive standalone
         run: |

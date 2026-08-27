@@ -20,15 +20,19 @@ ClickHouse Native wire format. Two entry points:
 clickhouse-c-rs = "0.1"
 ```
 
-No features are on by default, so the base crate needs only a C compiler
-and libc. The `lz4` and `zstd` features each link a system library and
-need its development package (`liblz4-dev` / `libzstd-dev` on Debian,
-`lz4` / `zstd` on Homebrew); `build.rs` locates them with `pkg-config`.
+`lz4` is on by default and links the system liblz4, so the build needs
+its development package (`liblz4-dev` on Debian, `lz4` on Homebrew);
+`build.rs` locates it with `pkg-config`. `zstd` is the same for libzstd,
+opt-in. For a build needing only a C compiler and libc:
+
+```toml
+clickhouse-c-rs = { version = "0.1", default-features = false }
+```
 
 ## Architecture
 
-1. **Vendored headers** under `clickhouse-c/`, pinned by
-   `clickhouse-c/UPSTREAM`. Override location with
+1. **`clickhouse-c/`**, a git submodule pinned by the gitlink and
+   restated in `UPSTREAM`. Override the location with
    `CHC_INCLUDE_DIR=<path>`.
 2. **`src/wrapper.c`** — single TU that `#define`s `CHC_IMPLEMENTATION`
    & includes each header the configured features select. `build.rs`
@@ -72,14 +76,18 @@ proportional to row count and most readers never index by them. Code that
 does should call `Block::validate` first on anything a peer sent.
 
 **Allocators thread through every owning constructor.** `chc_alloc` is
-a vtable. `Allocator` wraps it `Copy + Send + Sync`. `TypeAst` /
-`Block` / `Client` each take an `Allocator` at construction & store it;
-`Drop` calls the matching destroy with the same allocator the C side
-used. `BlockBuilder` needs none — it owns caller-side `chc_block_col`
-storage as a `Vec` and the C writer allocates nothing. `Client` boxes
-its `Allocator` so the
-heap address the C side stashes in `c->al` stays valid through every
-later call & through `chc_client_close`.
+a vtable. `Allocator` wraps it `Copy + Send + Sync`. `TypeAst`, `Block`,
+`Client`, `BlockReader`, and `IolessClient` each take one at construction
+and store it; `Drop` calls the matching destroy with the same allocator
+the C side used. `BlockBuilder` needs none — it owns caller-side
+`chc_block_col` storage as a `Vec` and the C writer allocates nothing.
+
+Three C structs — `chc_client`, `chc_async_client`, `chc_in` — stash the
+`chc_alloc *` they were initialized with and keep calling through that
+exact address. `Client`, `IolessClient`, and `BlockReader` box their
+`Allocator` so it has one that outlives the constructor and survives
+moves. `chc_type` and `chc_block` take theirs per call, so `TypeAst` and
+`Block` hold theirs inline.
 
 **No-copy columns.** The writer builds each column as a `chc_column`
 tree (`chc_build_fixed` / `_string` / `_nullable` / `_array` / `_tuple`
@@ -238,7 +246,7 @@ let sock = TcpStream::connect("localhost:9000")?;
 // `PosixIo::new(sock.as_fd())` — `Client<'_>` then borrows from `sock`.
 let io = PosixIo::new_owned(sock);
 
-let codec = Codec::lz4();        // feature = "lz4"
+let codec = Codec::lz4();        // feature = "lz4" (default)
 let mut opts = ClientOpts::new()
     .database("default")
     .user("default")
@@ -348,23 +356,35 @@ let mut client = Client::init(
 
 ## Feature flags
 
-All off by default.
+| Feature | Default | Effect | Needs |
+|---|---|---|---|
+| `lz4`   | on  | compile clickhouse-compression.h's LZ4 wrapper, link `-llz4`, expose `Codec::lz4()` | system `liblz4` |
+| `tls`   | off | rustls TLS: `tls::TlsIo` backend for the blocking `Client`, `AsyncClient::connect_tls`, `tls::default_config()` (webpki roots) | `rustls`, `webpki-roots`, `tokio-rustls` |
+| `tokio` | off | expose `AsyncClient` over `tokio::net::TcpStream` | `tokio` |
+| `zstd`  | off | compile clickhouse-compression.h's ZSTD wrapper, link `-lzstd`, expose `Codec::zstd()` | system `libzstd` |
 
-| Feature | Effect | Needs |
-|---|---|---|
-| `lz4`   | compile clickhouse-compression.h's LZ4 wrapper, link `-llz4`, expose `Codec::lz4()` | system `liblz4` |
-| `tls`   | rustls TLS: `tls::TlsIo` backend for the blocking `Client`, `AsyncClient::connect_tls`, `tls::default_config()` (webpki roots) | `rustls`, `webpki-roots`, `tokio-rustls` |
-| `tokio` | expose `AsyncClient` over `tokio::net::TcpStream` | `tokio` |
-| `zstd`  | compile clickhouse-compression.h's ZSTD wrapper, link `-lzstd`, expose `Codec::zstd()` | system `libzstd` |
+Async TLS needs both `tls` and `tokio`. `default-features = false` gives a
+build with no compression library linked; `Codec::empty()` and
+`Codec::from_raw()` stay available there for a caller-supplied codec.
 
-Async TLS needs both `tls` and `tokio`.
+## The clickhouse-c submodule
 
-## Header vendoring
+`clickhouse-c/` is a git submodule, so a fresh clone needs:
 
-Headers live under `clickhouse-c/` so the crate builds straight from a
-`git clone` or a published archive; `clickhouse-c/UPSTREAM` records the
-repository and revision they came from. Build against an out-of-tree
-checkout with:
+```sh
+git submodule update --init
+```
+
+`cargo package` walks initialized submodules, so the published archive
+carries the headers and a consumer never sees the submodule at all.
+Packaging with it uninitialized produces an archive that cannot build, so
+initialize before `cargo package` and let CI's packaged-crate job catch a
+slip.
+
+The gitlink is the pin. `UPSTREAM` restates the repository and revision in
+a form that survives into the archive, where there is no git;
+`clickhouse_c::UPSTREAM_REVISION` reports it at runtime, and CI fails if
+the two disagree. Build against a checkout elsewhere with:
 
 ```sh
 CHC_INCLUDE_DIR=/abs/path/to/clickhouse-c cargo build
@@ -427,10 +447,11 @@ Mirrors upstream's list plus Rust-specific items:
 - Runtimes other than Tokio — no adapter ships for them, but
   `IolessClient` is the whole protocol with no I/O, so writing one needs
   no `unsafe` and no `sys`
-- `Variant` / `Dynamic` / `JSON` / `AggregateFunction` decoding —
-  upstream excludes from v1 (25.x / 26.x wire format still shifting).
-  A `ColumnBuilder::string` column under a `JSON` type covers the
-  STRING-serialization write path
+- `Variant` / `Dynamic` / `AggregateFunction` decoding — upstream
+  excludes them from v1 (25.x / 26.x wire format still shifting) and
+  returns `ErrorKind::Type`; cast to `String` server-side. `JSON` and
+  `Object('json')` do decode, as `String` columns, with
+  `output_format_native_write_json_as_string=1` on the query
 
 ## License
 
