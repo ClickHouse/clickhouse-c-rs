@@ -1,6 +1,4 @@
-//! Self-contained coverage for `Column`/`Block::validate`,
-//! `PosixIo::set_read_timeout`, and `CancelToken`, over a loopback TCP pair
-//! so no external `clickhouse` binary is needed.
+//! Validation, timeout, and cancellation tests using loopback TCP.
 
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsFd;
@@ -11,7 +9,7 @@ use clickhouse_c::{
     PosixIo, TypeAst,
 };
 
-/// Connected (writer, reader) TCP pair on loopback.
+/// Creates connected loopback TCP pair as writer and reader.
 fn loopback_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -35,7 +33,7 @@ fn validate_accepts_roundtripped_block() {
     let mut bb = BlockBuilder::new();
     bb.append(&name, ty.view(), &col).expect("append");
     bb.write(wio.as_mut(), BlockOpts::default()).expect("write");
-    // Block is tiny, fits the socket buffer; closing flushes it to the reader.
+    // Small block fits socket buffer before reader starts
     drop(wio);
     drop(writer);
 
@@ -85,18 +83,18 @@ fn builder_accepts_oversized_slabs() {
     let alloc = Allocator::stdlib();
     let uint32 = TypeAst::parse("UInt32", alloc).expect("UInt32");
 
-    // 1 UInt32 row needs 4 bytes; hand in 8. Trailing slack is never read.
+    // Fixed column ignores bytes after required prefix
     let fixed = [1u8, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef];
     ColumnBuilder::fixed(&fixed, uint32.view().elem_size(), 1).expect("fixed slab with slack");
 
-    // 2 string rows ending at offset 3; data buffer runs past it.
+    // String column ignores data after final offset
     ColumnBuilder::string(&[1, 3], b"abcdefg", 2).expect("string slab with slack");
 }
 
 #[test]
 fn read_timeout_fires_on_idle_socket() {
     let alloc = Allocator::stdlib();
-    // Keep the server end alive but silent: no bytes, no EOF.
+    // Keep peer open without sending data or EOF
     let (writer, reader) = loopback_pair();
 
     let mut rio = PosixIo::new(reader.as_fd());
@@ -118,12 +116,12 @@ fn read_timeout_fires_on_idle_socket() {
         "read blocked past the deadline: {elapsed:?}"
     );
 
-    // Clearing the deadline restores blocking semantics for later reads.
+    // Clear deadline for later reads
     rio.as_mut().set_read_timeout(None);
     drop(writer);
 }
 
-/// Write one `UInt32` block of `values` into `sock`.
+/// Writes one UInt32 block to socket.
 fn write_block(sock: &TcpStream, values: &[u32]) {
     let alloc = Allocator::stdlib();
     let ty = TypeAst::parse("UInt32", alloc).expect("UInt32");
@@ -155,9 +153,7 @@ fn cancel_before_read_fails_without_touching_the_socket() {
     drop(writer);
 }
 
-/// A reader mid-stream, cancelled from another thread. The flag is checked
-/// before each refill, so the read that needs more bytes is the one that
-/// fails.
+/// Verifies cancellation from another thread before next refill.
 #[test]
 fn cancel_stops_a_reader_between_blocks() {
     let alloc = Allocator::stdlib();
@@ -175,14 +171,12 @@ fn cancel_stops_a_reader_between_blocks() {
         .expect("one block on the wire");
     assert_eq!(first.n_rows(), 2);
 
-    // Flip from another thread, joined before the next read so the test is
-    // about the wiring, not about winning a race.
+    // Join cancellation thread before next read
     std::thread::spawn(move || cancel.cancel())
         .join()
         .expect("flipper thread");
 
-    // No second block is on the wire; without the token this would park in
-    // read(2) forever.
+    // Cancellation prevents next read from blocking without input
     let Err(err) = block_reader.read() else {
         panic!("cancelled reader must not return another block");
     };
@@ -190,9 +184,7 @@ fn cancel_stops_a_reader_between_blocks() {
     drop(writer);
 }
 
-/// Pins the documented limit: the flag is read between transport reads, so a
-/// read already parked in `read(2)` runs to its deadline first and reports
-/// the timeout. The cancel lands on the following attempt.
+/// Verifies cancellation does not interrupt read already blocked in OS.
 #[test]
 fn cancel_during_a_parked_read_lands_on_the_next_attempt() {
     let alloc = Allocator::stdlib();
@@ -200,8 +192,7 @@ fn cancel_during_a_parked_read_lands_on_the_next_attempt() {
 
     let cancel = CancelToken::new();
     let mut rio = PosixIo::new_cancellable(reader.as_fd(), cancel.clone());
-    // Absolute deadline, so it must be armed before BlockReader borrows the
-    // backend.
+    // Set absolute deadline before reader borrows transport
     rio.as_mut()
         .set_read_timeout(Some(Duration::from_millis(100)));
 

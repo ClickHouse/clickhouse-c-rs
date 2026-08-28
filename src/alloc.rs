@@ -3,27 +3,28 @@ use core::ffi::c_void;
 
 use crate::sys;
 
-/// The `chc_alloc` vtable every owning handle carries.
+/// Allocator used for memory owned by clickhouse-c.
 ///
-/// `Copy`, and `Send + Sync` because the vtable is stateless function
-/// pointers. Whatever allocated an object must free it, so each handle keeps
-/// the allocator it was built with and calls the matching destroy on drop.
+/// Each owning handle retains its allocator and uses it when releasing memory.
+/// Allocator contains only function pointers and can be copied or shared
+/// between threads.
 #[derive(Clone, Copy)]
 pub struct Allocator {
     pub(crate) raw: sys::chc_alloc,
 }
 
 impl Allocator {
-    /// `malloc`/`realloc`/`free`-backed allocator from `clickhouse-c`.
+    /// Returns clickhouse-c allocator backed by `malloc`, `realloc`, and `free`.
     pub fn stdlib() -> Self {
         let raw = unsafe { sys::chc_alloc_stdlib() };
         Self { raw }
     }
 
-    /// Bridge any [`GlobalAlloc`] into a `chc_alloc` vtable. The reference
-    /// travels through the vtable's `ud` slot, so the allocator must outlive
-    /// every object parsed through it, hence `'static`. Alignment is fixed at
-    /// `align_of::<u128>()`, the max_align_t that `stdlib()`'s malloc gives.
+    /// Creates a clickhouse-c allocator backed by a Rust [`GlobalAlloc`].
+    ///
+    /// Allocator reference is stored in C user data and must remain valid for
+    /// every object that uses it. Allocations use `align_of::<u128>()`, which
+    /// matches alignment provided by [`stdlib`](Self::stdlib).
     pub fn global<A: GlobalAlloc + Sync>(a: &'static A) -> Self {
         Self {
             raw: sys::chc_alloc {
@@ -54,8 +55,7 @@ mod vtable {
     use core::alloc::{GlobalAlloc, Layout};
     use core::ffi::c_void;
 
-    // clickhouse-c allocates up to 16-byte scalars (Int128/UUID/Decimal128);
-    // matches the max_align_t that stdlib()'s malloc guarantees.
+    // Match alignment used by clickhouse-c for 16-byte scalar values
     const ALIGN: usize = core::mem::align_of::<u128>();
 
     #[inline]

@@ -1,18 +1,9 @@
-//! TLS over rustls (feature `tls`).
+//! Rustls transport support.
 //!
-//! Two surfaces:
-//!
-//! * [`TlsIo`] — an [`Io`] backend for the blocking
-//!   [`Client`](crate::Client). It owns a rustls `StreamOwned` over a
-//!   `std::net::TcpStream` and exposes a `chc_io` vtable whose read/write
-//!   callbacks drive `SSL`-equivalent rustls I/O. The C client never sees
-//!   the socket, mirroring the plaintext [`PosixIo`](crate::PosixIo) path.
-//! * [`default_config`] / [`config_with_roots`] — build an
-//!   `Arc<rustls::ClientConfig>` (Mozilla webpki roots, no client auth)
-//!   for both [`TlsIo`] and the async `AsyncClient::connect_tls`.
-//!
-//! `rustls` is re-exported so callers pin one version and can hand a
-//! bespoke `ClientConfig` (custom roots, client certs) to either path.
+//! [`TlsIo`] implements blocking [`Io`] over a rustls connection.
+//! [`default_config`] and [`config_with_roots`] create client configurations
+//! for blocking and asynchronous clients. Module re-exports `rustls` for
+//! custom root stores and client authentication.
 
 use core::ffi::{c_int, c_void};
 use core::marker::PhantomPinned;
@@ -27,19 +18,21 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::io::Io;
 use crate::sys;
 
-/// `ClientConfig` trusting the Mozilla webpki root set, no client auth.
-/// Suitable for public CAs (ClickHouse Cloud). For private CAs or mTLS,
-/// build a config via [`config_with_roots`] or rustls directly.
+/// Creates client configuration using Mozilla webpki roots without client
+/// authentication.
+///
+/// Use [`config_with_roots`] or rustls APIs for private certificate
+/// authorities or mutual TLS.
 pub fn default_config() -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     config_with_roots(roots)
 }
 
-/// `ClientConfig` over a caller-supplied root store, no client auth.
+/// Creates client configuration using provided roots without client
+/// authentication.
 pub fn config_with_roots(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
-    // Pin the provider explicitly so config building never depends on a
-    // process-default provider being installed elsewhere.
+    // Select provider independently of process-wide rustls configuration
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -51,12 +44,9 @@ pub fn config_with_roots(roots: rustls::RootCertStore) -> Arc<rustls::ClientConf
 
 type RustlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
-/// Blocking TLS [`Io`] backend: rustls over an owned `TcpStream`.
+/// Blocking TLS [`Io`] implementation over an owned `TcpStream`.
 ///
-/// Self-referential — the `chc_io` vtable's `ud` points back at the
-/// `TlsIo` so the C client's read/write calls land on `stream`. Hence the
-/// `Pin<Box<Self>>` the constructor returns: the node must not move while
-/// the [`Client`](crate::Client) holds the vtable pointer.
+/// Value is pinned because C callback table contains a pointer to its stream.
 pub struct TlsIo {
     io: sys::chc_io,
     stream: RustlsStream,
@@ -64,10 +54,10 @@ pub struct TlsIo {
 }
 
 impl TlsIo {
-    /// TLS-connect over an already TCP-connected `tcp`, verifying the peer
-    /// against `config` for `server_name` (also sent as SNI). Drives the
-    /// handshake to completion so certificate / SNI / verification errors
-    /// surface here rather than on the first query.
+    /// Creates TLS transport over connected TCP socket.
+    ///
+    /// Peer is verified using `config` and `server_name`. Server name is also
+    /// sent as SNI. Method completes TLS handshake before returning.
     pub fn connect(
         tcp: TcpStream,
         server_name: &str,
@@ -98,8 +88,7 @@ impl TlsIo {
             stream,
             _pin: PhantomPinned,
         });
-        // Wire ud at the pinned node so the callbacks recover `stream`.
-        // SAFETY: only sets a field; never moves out of the pin.
+        // Set callback context after address becomes stable
         unsafe {
             let this = boxed.as_mut().get_unchecked_mut();
             this.io.ud = (this as *mut Self).cast();
@@ -108,13 +97,10 @@ impl TlsIo {
     }
 }
 
-// SAFETY: `io` is a fully wired chc_io embedded in the pinned TlsIo; its
-// `ud` back-points at the same node (fixed address under Pin) and
-// tls_read/tls_write honor the vtable contract. Valid until the retaining
-// Client drops, which then drops this backend.
+// SAFETY: callback table and context remain valid within pinned TlsIo
 unsafe impl Io for TlsIo {
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
-        // SAFETY: hands back the address of a field; does not move `self`.
+        // SAFETY: returning field address does not move pinned value
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
 
@@ -127,10 +113,7 @@ unsafe impl Io for TlsIo {
     }
 }
 
-// The chc_io.ud raw pointer makes TlsIo !Send automatically. It points at
-// the boxed TlsIo's own heap node, whose address is stable across moves of
-// the owning Box, and is dereferenced only from the C client's read/write
-// calls, which run single-threaded on whatever thread owns the Client.
+// C client uses pinned callback context from one thread at a time
 unsafe impl Send for TlsIo {}
 
 unsafe extern "C" fn tls_read(
@@ -147,8 +130,7 @@ unsafe extern "C" fn tls_read(
     let io = unsafe { &mut *(ud as *mut TlsIo) };
     let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
     match io.stream.read(dst) {
-        // n == 0 is clean EOF, mirroring the posix backend; the C reader
-        // turns it into CHC_ERR_EOF if it still wanted bytes.
+        // C reader converts zero count to EOF when more bytes are required
         Ok(n) => {
             unsafe { *out_n = n };
             sys::CHC_OK
@@ -165,15 +147,14 @@ unsafe extern "C" fn tls_write(
 ) -> c_int {
     let io = unsafe { &mut *(ud as *mut TlsIo) };
     let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-    // Contract matches the posix backend: write all `len` bytes or fail.
-    // flush pushes the encrypted records out to the socket.
+    // Callback must write and flush complete input or fail
     match io.stream.write_all(src).and_then(|()| io.stream.flush()) {
         Ok(()) => sys::CHC_OK,
         Err(e) => unsafe { set_err(err, sys::CHC_ERR_IO, &format!("tls write: {e}")) },
     }
 }
 
-/// Copy a NUL-terminated diagnostic into `err.msg` and return `code`.
+/// Copies null-terminated message into C error and returns `code`.
 unsafe fn set_err(err: *mut sys::chc_err, code: c_int, msg: &str) -> c_int {
     if !err.is_null() {
         let e = unsafe { &mut *err };

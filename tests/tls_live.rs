@@ -1,7 +1,6 @@
-//! Live TLS smoke test against a real (e.g. ClickHouse Cloud) endpoint.
+//! TLS smoke test using an external ClickHouse endpoint.
 //!
-//! Hits an external network service, so it is `#[ignore]`d by default.
-//! Run explicitly:
+//! Test is ignored by default. Run explicitly:
 //!
 //! ```sh
 //! CHC_TLS_HOST=... \
@@ -9,10 +8,10 @@
 //! cargo test -p clickhouse-c-rs --features tls,tokio --test tls_live -- --ignored --nocapture
 //! ```
 //!
-//! Env: `CHC_TLS_HOST` (required), `CHC_TLS_PORT` (default 9440),
-//! `CHC_TLS_USER` (default "default"), `CHC_TLS_PASSWORD` (default ""),
-//! `CHC_TLS_DB` (default "default"). Verifies the peer against the public
-//! webpki root set via `tls::default_config()`.
+//! Environment variables are `CHC_TLS_HOST` (required), `CHC_TLS_PORT`
+//! (default 9440), `CHC_TLS_USER` (default `default`), `CHC_TLS_PASSWORD`
+//! (default empty), and `CHC_TLS_DB` (default `default`). Peer verification
+//! uses public webpki roots from `tls::default_config()`.
 
 use std::net::TcpStream;
 
@@ -100,8 +99,7 @@ async fn sync_tls_live() -> TestResult {
         return Ok(());
     };
 
-    // Blocking Client over TlsIo. No `.await` between connect and drain,
-    // so the !Sync client never crosses an await point.
+    // Complete blocking client work without crossing await point
     let addr = format!("{}:{}", ep.host, ep.port);
     let tcp = TcpStream::connect(&addr)?;
     tcp.set_nodelay(true).ok();

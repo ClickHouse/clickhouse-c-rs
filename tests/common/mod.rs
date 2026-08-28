@@ -1,7 +1,6 @@
-//! Spawns a throwaway `clickhouse server` for the integration tests.
+//! Temporary ClickHouse server for integration tests.
 //!
-//! Every test that needs a live server skips itself when `clickhouse` is not
-//! on PATH, so a checkout without it still runs the rest of the suite.
+//! Tests skip when `clickhouse` is unavailable.
 
 #![allow(dead_code)]
 
@@ -12,10 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Held for a server's whole life. Test binaries run their tests in parallel
-/// threads, and several ClickHouse servers racing to start on one machine is
-/// how "did not become ready" flakes appear; one at a time costs a second per
-/// test and removes the class.
+/// Serializes temporary server startup within each test process.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -31,11 +27,11 @@ pub fn clickhouse_on_path() -> bool {
 }
 
 pub struct ChServer {
-    // Declared first so it is released last, after the child is reaped.
+    // Release server lock after child exits
     _slot: MutexGuard<'static, ()>,
     child: Child,
     pub tcp_port: u16,
-    /// Set only when spawned with a certificate.
+    /// Certificate authority path for TLS server.
     pub secure_port: Option<u16>,
     _tmp: tempfile::TempDir,
 }
@@ -45,18 +41,18 @@ impl ChServer {
         Self::start(None, &[])
     }
 
-    /// Spawn with extra `--name=value` server overrides.
+    /// Starts server with additional `--name=value` options.
     pub fn spawn_with(extra: &[&str]) -> TestResult<Self> {
         Self::start(None, extra)
     }
 
-    /// Spawn with a native secure port terminating TLS with `cert` / `key`.
+    /// Starts server with secure native port using `cert` and `key`.
     pub fn spawn_tls(cert: &Path, key: &Path) -> TestResult<Self> {
         Self::start(Some((cert, key)), &[])
     }
 
     fn start(tls: Option<(&Path, &Path)>, extra: &[&str]) -> TestResult<Self> {
-        // A panicking test poisons the lock; the next one still wants a server.
+        // Recover lock after prior test panic
         let slot = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir()?;
         let data_dir = tmp.path().join("ch");
@@ -99,9 +95,7 @@ impl ChServer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // Own process group: SYSTEM SHUTDOWN is the clean path, but a test
-        // that panics mid-run should not leave a server parented to the
-        // harness.
+        // Separate process group allows cleanup after test panic
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -133,8 +127,7 @@ impl ChServer {
         Err(io::Error::other("clickhouse server did not become ready").into())
     }
 
-    /// Run `sql` through the `clickhouse client` binary, out of band from the
-    /// crate under test.
+    /// Runs SQL through `clickhouse client` binary.
     pub fn query(&self, sql: &str) -> TestResult<String> {
         let out = Command::new("clickhouse")
             .args([
@@ -168,8 +161,7 @@ impl Drop for ChServer {
                 Err(_) => break,
             }
         }
-        // Kill the whole group: the server forks helpers that outlive a
-        // plain kill on the parent pid.
+        // Stop helper processes in server process group
         #[cfg(unix)]
         {
             let pgid = self.child.id() as i32;
@@ -186,8 +178,7 @@ impl Drop for ChServer {
     }
 }
 
-/// Bind port 0, read the assignment, release it. Racy in principle; in
-/// practice the kernel does not hand the same ephemeral port straight back.
+/// Reserves an ephemeral port number and releases it before server startup.
 fn free_port() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     listener.local_addr().map(|a| a.port())

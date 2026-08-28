@@ -1,11 +1,8 @@
-//! Block writer. clickhouse-c never copies the slabs handed in, nor the
-//! `chc_column` nodes: `chc_build_*` returns a node by value whose wrapper
-//! arms alias the caller's child nodes (see the header's stack example).
-//! A [`ColumnBuilder`] is one such node, owned by the caller; wrappers borrow
-//! their child, so the borrow checker pins the child in place until the write
-//! without any heap. [`BlockBuilder::append`] records a borrowed root against
-//! a name and type. The `'a` lifetime binds names, slabs and child nodes so
-//! all outlive the write.
+//! Native block construction and writing.
+//!
+//! [`ColumnBuilder`] borrows source data without copying it. Wrapper columns
+//! also borrow their child columns. [`BlockBuilder`] retains these borrows
+//! until block is written.
 
 use core::ffi::c_int;
 use core::marker::PhantomData;
@@ -17,34 +14,30 @@ use crate::io::Io;
 use crate::sys;
 use crate::types::TypeRef;
 
-/// One `chc_column` node over caller-owned slabs, mirroring the `chc_build_*`
-/// constructors. Compose leaves ([`ColumnBuilder::fixed`],
-/// [`ColumnBuilder::string`]) with wrappers ([`ColumnBuilder::nullable`],
-/// [`ColumnBuilder::array`], [`ColumnBuilder::low_cardinality`], [`ColumnBuilder::tuple`]) to
-/// match any composite the reader emits, e.g. `Array(Nullable(UInt32))`.
-/// Every node is a caller local; a wrapper borrows its child, so the child
-/// cannot move (its node address stays valid) while the wrapper aliases it:
+/// Column descriptor over borrowed data.
+///
+/// Create leaf columns with [`fixed`](Self::fixed) or [`string`](Self::string).
+/// Create composite columns with [`nullable`](Self::nullable),
+/// [`array`](Self::array), [`low_cardinality`](Self::low_cardinality), or
+/// [`tuple`](Self::tuple). Composite builders borrow their child builders:
 ///
 /// ```ignore
 /// let leaf = ColumnBuilder::fixed(values, 4, 3)?;
-/// let nul = leaf.nullable(null_map)?;   // borrows leaf
-/// let arr = nul.array(offsets, 2)?;     // borrows nul
-/// bb.append("v", ty.view(), &arr)?;     // borrows arr until the write
+/// let nullable = leaf.nullable(null_map)?;
+/// let array = nullable.array(offsets, 2)?;
+/// block.append("v", ty.view(), &array)?;
 /// ```
-///
-/// Runtime-shaped trees keep their nodes in caller-owned storage (a `Vec`
-/// or per-depth arena the consumer manages); the kernel itself never
-/// allocates. The `'a` lifetime binds the borrowed slabs and child nodes.
 pub struct ColumnBuilder<'a> {
-    // `chc_build_*` output; wrapper arms alias caller child nodes borrowed for
-    // `'a`, so the node is only valid while those children stay put.
+    // Wrapper variants contain pointers to borrowed child nodes
     node: sys::chc_column,
     _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> ColumnBuilder<'a> {
-    /// Fixed-width leaf. `data` must hold at least `n_rows * elem_size`
-    /// little-endian bytes; trailing slack is never read.
+    /// Creates a fixed-width column.
+    ///
+    /// `data` must contain at least `n_rows * elem_size` little-endian bytes.
+    /// Additional bytes are ignored.
     pub fn fixed(data: &'a [u8], elem_size: usize, n_rows: usize) -> Result<Self> {
         if elem_size == 0 {
             return Err(usage("fixed column: elem_size must be nonzero"));
@@ -59,10 +52,11 @@ impl<'a> ColumnBuilder<'a> {
         }))
     }
 
-    /// `String` leaf. `offsets[i]` is the cumulative exclusive end of row
-    /// `i` in `data`, host byte order. Also used for `JSON` / `Object` and
-    /// LowCardinality dictionaries, whose bodies share the string wire
-    /// shape.
+    /// Creates a string column.
+    ///
+    /// `offsets[i]` contains exclusive end of row `i` in `data`, in host byte
+    /// order. Same layout supports string-encoded JSON and LowCardinality
+    /// dictionaries.
     pub fn string(offsets: &'a [u64], data: &'a [u8], n_rows: usize) -> Result<Self> {
         validate_string(offsets, data.len(), n_rows, "string")?;
         Ok(node(unsafe {
@@ -70,10 +64,10 @@ impl<'a> ColumnBuilder<'a> {
         }))
     }
 
-    /// Wrap `self` in a `Nullable`. `null_map[i] == 1` marks row `i` NULL;
-    /// its length must equal the inner row count. Rows carry a defined
-    /// inner value even when NULL, so the inner slab stays dense. The result
-    /// borrows `self` so its node stays put until the write.
+    /// Creates a nullable column around this column.
+    ///
+    /// `null_map[i] == 1` marks row `i` as null. Map length must equal inner
+    /// row count. Inner column must contain a value for every row.
     pub fn nullable<'r>(&'r self, null_map: &'r [u8]) -> Result<ColumnBuilder<'r>> {
         require_len("nullable null map", null_map.len(), self.n_rows())?;
         let inner = self.node_ptr().cast_mut();
@@ -82,9 +76,10 @@ impl<'a> ColumnBuilder<'a> {
         }))
     }
 
-    /// Wrap `self` (the element values) in an `Array` of `n_rows` rows.
-    /// `offsets[i]` is the cumulative exclusive end of row `i`; the final
-    /// offset must equal the element row count of `self`.
+    /// Creates an array column using this column as element storage.
+    ///
+    /// `offsets[i]` contains cumulative exclusive end of row `i`. Final offset
+    /// must equal row count of element column.
     pub fn array<'r>(&'r self, offsets: &'r [u64], n_rows: usize) -> Result<ColumnBuilder<'r>> {
         let inner_n = validate_offsets(offsets, n_rows, "array")?;
         require_len("array values", self.n_rows(), inner_n)?;
@@ -94,10 +89,11 @@ impl<'a> ColumnBuilder<'a> {
         }))
     }
 
-    /// Wrap `self` (the dictionary) in a `LowCardinality` of `n_rows` rows.
-    /// `key_size` is 1/2/4/8 bytes; each key indexes the dictionary. For
-    /// `LowCardinality(Nullable(T))` reserve dict slot 0 as the null
-    /// sentinel and store key 0 for null rows.
+    /// Creates a LowCardinality column using this column as dictionary.
+    ///
+    /// `key_size` must be 1, 2, 4, or 8 bytes. Each key indexes dictionary.
+    /// `LowCardinality(Nullable(T))` uses dictionary entry zero and key zero
+    /// for null rows.
     pub fn low_cardinality<'r>(
         &'r self,
         key_size: i32,
@@ -111,12 +107,12 @@ impl<'a> ColumnBuilder<'a> {
         }))
     }
 
-    /// `Tuple` over `children`, all sharing one row count. Also the basis
-    /// for `Map` (`Array(Tuple(K, V))`) and geo types. `chc_build_tuple`
-    /// aliases a `*mut chc_column` array, so the caller passes `ptrs` as
-    /// scratch (length must equal `children`); both it and `children` stay
-    /// borrowed until the write. A fixed-arity tuple can stack-allocate
-    /// `ptrs` (`[ptr::null_mut(); N]`); a runtime-arity one owns a `Vec`.
+    /// Creates a tuple column from `children`.
+    ///
+    /// All children must have same row count. `ptrs` provides temporary
+    /// pointer storage and must have same length as `children`. Returned
+    /// builder borrows both slices. Maps and geographic types use tuple
+    /// storage internally.
     pub fn tuple<'r>(
         children: &'r [ColumnBuilder<'a>],
         ptrs: &'r mut [*mut sys::chc_column],
@@ -146,7 +142,7 @@ impl<'a> ColumnBuilder<'a> {
         }))
     }
 
-    /// Row count at this node's level (`chc_column_n_rows`).
+    /// Returns row count for this column.
     pub fn n_rows(&self) -> usize {
         self.node.n_rows
     }
@@ -156,7 +152,7 @@ impl<'a> ColumnBuilder<'a> {
     }
 }
 
-// Wrap a `chc_build_*` node at whatever lifetime the caller's borrows imply.
+// Bind C node to lifetime of data referenced by it
 fn node<'x>(node: sys::chc_column) -> ColumnBuilder<'x> {
     ColumnBuilder {
         node,
@@ -164,12 +160,9 @@ fn node<'x>(node: sys::chc_column) -> ColumnBuilder<'x> {
     }
 }
 
-/// Append-side counterpart to [`Block`](crate::Block). The lifetime `'a`
-/// binds caller-owned column names and the [`ColumnBuilder`] nodes (with the
-/// slabs they reference), all borrowed without copying until the write.
+/// Native block assembled from borrowed column data.
 pub struct BlockBuilder<'a> {
-    // Storage the `chc_block_builder` points at; kept in sync with `raw`.
-    // Each `col` aliases a caller node borrowed for `'a`.
+    // Raw builder points into this allocation
     cols: Vec<sys::chc_block_col>,
     raw: sys::chc_block_builder,
     n_rows: Option<usize>,
@@ -183,8 +176,7 @@ impl<'a> Default for BlockBuilder<'a> {
 }
 
 impl<'a> BlockBuilder<'a> {
-    /// An empty block. Row count is fixed by the first
-    /// [`append`](Self::append).
+    /// Creates an empty block. First appended column sets row count.
     pub fn new() -> Self {
         Self {
             cols: Vec::new(),
@@ -194,10 +186,10 @@ impl<'a> BlockBuilder<'a> {
         }
     }
 
-    /// Append a [`ColumnBuilder`] under `name` with full CH type `ty`. The
-    /// column must match `ty` structurally (checked by the C writer) and
-    /// share the block's row count. The node is borrowed for `'a`, so it (and
-    /// the slabs it references) must outlive the write.
+    /// Adds a named column with ClickHouse type `ty`.
+    ///
+    /// Column must match `ty` and use same row count as other columns. Builder
+    /// borrows column and its data until block is written.
     pub fn append(
         &mut self,
         name: &'a str,
@@ -220,16 +212,17 @@ impl<'a> BlockBuilder<'a> {
             type_: ty.raw,
             col: col_ptr,
         });
-        // `cols` may have just reallocated; re-point `raw` at its buffer.
+        // Refresh pointer after possible Vec reallocation
         self.raw.cols = self.cols.as_mut_ptr();
         self.raw.n_cols = self.cols.len();
         self.raw.n_rows = n_rows;
         Ok(())
     }
 
-    /// Serialize through any [`Io`] backend. `opts` matches what
-    /// [`BlockReader`] uses; `clickhouse local` accepts the default
-    /// (all-zeros).
+    /// Writes block through an [`Io`] implementation.
+    ///
+    /// `opts` must describe expected framing. `clickhouse local` accepts
+    /// [`BlockOpts::default`].
     ///
     /// [`BlockReader`]: crate::BlockReader
     pub fn write<I: Io + ?Sized>(&self, io: Pin<&mut I>, opts: BlockOpts) -> Result<()> {
@@ -255,8 +248,7 @@ fn checked_len(count: usize, width: usize, label: &str) -> Result<usize> {
         .ok_or_else(|| usage(format!("{label} length overflow: {count} * {width}")))
 }
 
-// Row-count arrays (offsets, null maps, LC keys) restate `n_rows`; a
-// mismatch means the caller disagrees with itself, so require exact.
+// Row metadata lengths must exactly match declared row count
 fn require_len(label: &str, actual: usize, expected: usize) -> Result<()> {
     if actual == expected {
         Ok(())
@@ -267,8 +259,7 @@ fn require_len(label: &str, actual: usize, expected: usize) -> Result<()> {
     }
 }
 
-// Raw byte slabs are read as a computed prefix; C never sees the slab
-// length, so trailing slack is harmless. Only the too-short case is a bug.
+// C reads required prefix and ignores extra bytes
 fn require_covers(label: &str, actual: usize, needed: usize) -> Result<()> {
     if actual >= needed {
         Ok(())
@@ -338,16 +329,10 @@ fn validate_low_cardinality_keys(
     Ok(())
 }
 
-// A node is a read-only descriptor over borrowed slabs and child nodes with
-// no interior mutability; the raw pointers it carries only alias caller data.
-// Callers own nodes as locals now, held across the async send await, so they
-// must cross threads on the same terms as `BlockBuilder`.
+// Raw pointers only provide read access to borrowed data
 unsafe impl Send for ColumnBuilder<'_> {}
 unsafe impl Sync for ColumnBuilder<'_> {}
 
 unsafe impl Send for BlockBuilder<'_> {}
-// Sync: a shared `&BlockBuilder` only exposes read-only operations
-// (`as_ptr`, `write`); mutation requires `&mut self`. The async client
-// holds `&BlockBuilder` across the `send_data` await, so the borrow
-// must be `Send`, which needs the builder `Sync`.
+// Shared references only permit read operations, including asynchronous send
 unsafe impl Sync for BlockBuilder<'_> {}

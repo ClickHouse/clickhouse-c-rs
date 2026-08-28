@@ -1,6 +1,4 @@
-//! Type AST. A [`TypeAst`] owns a parsed `chc_type *` and exposes
-//! accessors for the discriminant, child types, fixed-size metadata,
-//! enum entries, and so on.
+//! ClickHouse type parsing and inspection.
 
 use core::ffi::c_char;
 use core::ptr::NonNull;
@@ -10,7 +8,7 @@ use crate::alloc::Allocator;
 use crate::error::{Result, check};
 use crate::sys;
 
-/// Wide enum mirror of `chc_kind`.
+/// ClickHouse type kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Kind {
@@ -71,9 +69,7 @@ pub enum Kind {
 
 impl Kind {
     pub(crate) fn from_raw(k: sys::chc_kind) -> Option<Self> {
-        // Safe: chc_kind values are a closed enum on the C side; cast back
-        // when the discriminant maps to one of our variants.
-        // Any out-of-range value is reported as None.
+        // Return None for values added to C API but not represented here
         Some(match k {
             sys::CHC_VOID => Self::Void,
             sys::CHC_INT8 => Self::Int8,
@@ -133,14 +129,16 @@ impl Kind {
     }
 }
 
-/// Owning parsed type. `Drop` frees via the same allocator used to parse.
+/// Parsed ClickHouse type.
+///
+/// Value releases its memory with allocator passed to [`parse`](Self::parse).
 pub struct TypeAst {
     raw: NonNull<sys::chc_type>,
     alloc: Allocator,
 }
 
 impl TypeAst {
-    /// Parse a ClickHouse type name (e.g. `"Array(Nullable(UInt32))"`).
+    /// Parses a ClickHouse type name such as `"Array(Nullable(UInt32))"`.
     pub fn parse(name: &str, alloc: Allocator) -> Result<Self> {
         let mut out: *mut sys::chc_type = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
@@ -160,7 +158,7 @@ impl TypeAst {
         })
     }
 
-    /// View into the underlying `chc_type *`.
+    /// Returns a borrowed view of parsed type.
     pub fn view(&self) -> TypeRef<'_> {
         TypeRef {
             raw: self.raw.as_ptr().cast_const(),
@@ -177,8 +175,7 @@ impl Drop for TypeAst {
 
 unsafe impl Send for TypeAst {}
 
-/// Borrowed view into a `chc_type`, returned both from parsed [`TypeAst`]
-/// and from block/column accessors where the C side owns the type.
+/// Borrowed view of a ClickHouse type.
 #[derive(Clone, Copy)]
 pub struct TypeRef<'a> {
     pub(crate) raw: *const sys::chc_type,
@@ -190,9 +187,10 @@ impl<'a> TypeRef<'a> {
         Kind::from_raw(unsafe { sys::chc_type_kind(self.raw) })
     }
 
-    /// Child types: the element of an `Array`, the fields of a `Tuple`, the
-    /// key and value of a `Map`, the inner type of a `Nullable` or
-    /// `LowCardinality`.
+    /// Returns number of child types.
+    ///
+    /// Child types include array elements, tuple fields, map keys and values,
+    /// and inner types of `Nullable` and `LowCardinality`.
     pub fn n_children(&self) -> usize {
         unsafe { sys::chc_type_n_children(self.raw) }
     }
@@ -209,39 +207,38 @@ impl<'a> TypeRef<'a> {
         }
     }
 
-    /// `N` in `FixedString(N)`, else 0. For the width of any scalar's
-    /// storage use [`elem_size`](Self::elem_size).
+    /// Returns `N` for `FixedString(N)`, or zero for other types.
     pub fn fixed_size(&self) -> i32 {
         unsafe { sys::chc_type_fixed_size(self.raw) }
     }
 
-    /// Bytes one value of this type occupies in a
-    /// [`Fixed`](crate::ColumnLayout::Fixed) column, 0 for types with no
-    /// fixed width.
+    /// Returns byte width in a [`Fixed`](crate::ColumnLayout::Fixed) column.
+    /// Returns zero for types without fixed-width storage.
     pub fn elem_size(&self) -> usize {
         unsafe { sys::chc_type_elem_size(self.raw) }
     }
 
-    /// `P` in `Decimal(P, S)`, else 0.
+    /// Returns `P` for `Decimal(P, S)`, or zero for other types.
     pub fn decimal_precision(&self) -> i32 {
         unsafe { sys::chc_type_decimal_precision(self.raw) }
     }
 
-    /// `S` in `Decimal(P, S)`, else 0.
+    /// Returns `S` for `Decimal(P, S)`, or zero for other types.
     pub fn decimal_scale(&self) -> i32 {
         unsafe { sys::chc_type_decimal_scale(self.raw) }
     }
 
-    /// Sub-second digits in `DateTime64(S)` / `Time64(S)`, else 0.
+    /// Returns subsecond precision for `DateTime64(S)` or `Time64(S)`.
+    /// Returns zero for other types.
     pub fn datetime64_scale(&self) -> i32 {
         unsafe { sys::chc_type_datetime64_scale(self.raw) }
     }
 
-    /// `N` in `QBit(T, N)`, the vector dimension. 0 on other kinds.
+    /// Returns `N` for `QBit(T, N)`, or zero for other types.
     ///
-    /// A QBit column arrives as [`ColumnLayout::Tuple`] of
-    /// [`qbit_element_size`] fixed columns, MSB bit-plane first, each row
-    /// holding `ceil(N / 8)` bytes.
+    /// A QBit column uses [`ColumnLayout::Tuple`] with one fixed column per
+    /// bit in `T`. Columns use most significant bit first, and each row holds
+    /// `ceil(N / 8)` bytes.
     ///
     /// [`ColumnLayout::Tuple`]: crate::ColumnLayout::Tuple
     /// [`qbit_element_size`]: TypeRef::qbit_element_size
@@ -249,25 +246,25 @@ impl<'a> TypeRef<'a> {
         unsafe { sys::chc_type_qbit_dimension(self.raw) }
     }
 
-    /// Width of `T` in `QBit(T, N)` in bits: 16, 32, or 64, one per
-    /// bit-plane column. 0 on other kinds.
+    /// Returns bit width of `T` in `QBit(T, N)`, or zero for other types.
+    /// Supported widths are 16, 32, and 64.
     pub fn qbit_element_size(&self) -> usize {
         unsafe { sys::chc_type_qbit_element_size(self.raw) }
     }
 
-    /// Bytes the C library copied from the wire; not UTF-8-validated.
+    /// Returns timezone bytes without UTF-8 validation.
     pub fn timezone(&self) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_timezone(self.raw, &mut len) };
         if p.is_null() {
             None
         } else {
-            // SAFETY: pointer borrowed from C, valid for 'a.
+            // SAFETY: C allocation remains valid for lifetime of borrowed type
             Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
         }
     }
 
-    /// Bytes the C library copied from the wire; not UTF-8-validated.
+    /// Returns type name bytes without UTF-8 validation.
     pub fn name(&self) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_name(self.raw, &mut len) };
@@ -278,13 +275,14 @@ impl<'a> TypeRef<'a> {
         }
     }
 
-    /// Entries in an `Enum8` / `Enum16`, else 0.
+    /// Returns number of entries for `Enum8` or `Enum16`.
+    /// Returns zero for other types.
     pub fn enum_count(&self) -> usize {
         unsafe { sys::chc_type_enum_count(self.raw) }
     }
 
-    /// Returns `(name_bytes, value)` for the `i`'th enum entry. Name
-    /// bytes are not UTF-8-validated.
+    /// Returns name and value for enum entry at `i`.
+    /// Name bytes are not validated as UTF-8.
     pub fn enum_at(&self, i: usize) -> Option<(&'a [u8], i64)> {
         if i >= self.enum_count() {
             return None;
@@ -304,7 +302,7 @@ impl<'a> TypeRef<'a> {
         ))
     }
 
-    /// Tuple field name bytes; not UTF-8-validated.
+    /// Returns tuple field name bytes without UTF-8 validation.
     pub fn tuple_field_name(&self, i: usize) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_tuple_field_name(self.raw, i, &mut len) };
@@ -315,9 +313,9 @@ impl<'a> TypeRef<'a> {
         }
     }
 
-    /// Render the type name into a `String`. Returns an empty string if
-    /// the reported `needed` length would overflow `usize` on `+ 1` (the
-    /// C library should never publish a value that large).
+    /// Formats type as a ClickHouse type name.
+    ///
+    /// Returns an empty string if required buffer length exceeds `usize`.
     pub fn format(&self) -> String {
         let needed = unsafe { sys::chc_type_format(self.raw, core::ptr::null_mut(), 0) };
         if needed == 0 {
@@ -361,9 +359,7 @@ mod tests {
         assert_eq!(ty.view().qbit_element_size(), 0);
     }
 
-    // Kind is #[repr(i32)] over the generated constants, so an unmapped
-    // discriminant must surface as None rather than transmuting into a
-    // neighbouring variant.
+    // Unknown C discriminants must not convert to adjacent Rust variants
     #[test]
     fn unknown_discriminant_is_none() {
         assert_eq!(Kind::from_raw(i32::MAX), None);

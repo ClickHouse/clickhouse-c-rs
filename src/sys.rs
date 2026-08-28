@@ -1,12 +1,7 @@
-//! FFI bindings for clickhouse-c.
+//! Raw FFI bindings for clickhouse-c.
 //!
-//! Struct definitions and `extern` declarations are hand-written to keep
-//! the surface auditable and avoid pulling in bindgen + libclang.
-//!
-//! Integer constants from `enum` blocks and a few `#define`s are
-//! scanned out of the headers at build time by `build.rs` and pulled in
-//! via the `include!` below. Bumping the vendored headers automatically
-//! re-syncs the constants.
+//! Structures and functions mirror public C headers. `build.rs` reads integer
+//! constants from bundled headers and generates corresponding Rust constants.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -15,19 +10,19 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-/* ---- named C-enum types (consts that reference these live below) ---- */
+/* C enum types */
 
 pub type chc_kind = c_int;
 pub type chc_col_kind = c_int;
 pub type chc_compression = c_int;
 pub type chc_packet_kind = c_int;
 
-// Bare literal (not behind a #define upstream); kept hand-written.
+// Header uses literal rather than named macro
 pub const CHC_ERR_NAME_LEN: usize = 64;
 
 include!(concat!(env!("OUT_DIR"), "/sys_constants.rs"));
 
-/* ---- errors ---- */
+/* Errors */
 
 #[repr(C)]
 pub struct chc_err {
@@ -46,7 +41,7 @@ impl chc_err {
     }
 }
 
-/* ---- allocator ---- */
+/* Allocator */
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -68,21 +63,16 @@ unsafe extern "C" {
     pub fn chc_alloc_stdlib() -> chc_alloc;
 }
 
-/* ---- crate-local C helpers (src/wrapper.c) ---- */
+/* Local C helpers from src/wrapper.c */
 
 unsafe extern "C" {
-    // CLOCK_MONOTONIC microseconds in clickhouse-c's own clock domain, so
-    // Rust-computed read deadlines line up with the posix-io poll loop.
+    // Use same monotonic clock as POSIX backend deadlines
     pub fn chc_rs_monotonic_us() -> i64;
 }
 
-/* ---- io ---- */
+/* I/O */
 
-// Read/write/cancel vtable the C library drives. POD, declared in the
-// public section of clickhouse.h (not behind CHC_IMPLEMENTATION), so the
-// layout is stable to mirror. The posix path (src/io.rs) lets
-// chc_posix_io_init populate one over a raw fd; the rustls path
-// (src/tls.rs) constructs one directly with Rust extern "C" callbacks.
+// Public callback table from clickhouse.h
 #[repr(C)]
 pub struct chc_io {
     pub ud: *mut c_void,
@@ -106,19 +96,14 @@ pub struct chc_io {
     pub check_cancel: Option<unsafe extern "C" fn(ud: *mut c_void) -> c_int>,
 }
 
-// Buffered reader clickhouse-c parses through. The struct body lives behind
-// CHC_IMPLEMENTATION, so Rust cannot allocate one by value; chc_rs_in_new /
-// chc_rs_in_new_ioless (src/wrapper.c) box one through the caller's allocator
-// and hand back this opaque handle.
+// Implementation-private buffered reader allocated through C helpers
 #[repr(C)]
 pub struct chc_in {
     _opaque: [u8; 0],
 }
 
 unsafe extern "C" {
-    // Lifecycle on an already-allocated chc_in. Two modes: io-backed, which
-    // refills from a chc_io, and ioless, which parses only bytes handed to
-    // chc_in_submit and returns CHC_WOULD_BLOCK past them.
+    // Supports callback-backed and submitted-input modes
     pub fn chc_in_init(
         input: *mut chc_in,
         io: *mut chc_io,
@@ -133,24 +118,20 @@ unsafe extern "C" {
         len: usize,
         err: *mut chc_err,
     ) -> c_int;
-    /// Unconsumed bytes still buffered.
+    /// Returns number of unconsumed buffered bytes.
     pub fn chc_in_available(input: *const chc_in) -> usize;
-    /// Drop consumed bytes and compact.
+    /// Removes consumed bytes and compacts buffer.
     pub fn chc_in_reset(input: *mut chc_in);
     pub fn chc_in_free(input: *mut chc_in);
 }
 
-// Blocking POSIX-fd backend state for chc_io, declared in
-// clickhouse-posix-io.h (struct body is public; the implementation lives in
-// the wrapper.c TU). chc_posix_io_init populates this and the chc_io vtable
-// it feeds, pointing the vtable's `ud` back at this state; src/io.rs holds
-// both inline in a pinned PosixIo so the pair keeps a fixed address.
+// Public POSIX file descriptor backend state from clickhouse-posix-io.h
 #[repr(C)]
 pub struct chc_posix_io {
     pub fd: c_int,
     pub check_cancel: Option<unsafe extern "C" fn(ud: *mut c_void) -> bool>,
     pub cancel_ud: *mut c_void,
-    // Monotonic-us deadline applied to each blocking read; 0 disables.
+    // Absolute monotonic deadline in microseconds, zero disables timeout
     pub deadline_us: i64,
 }
 
@@ -165,7 +146,7 @@ unsafe extern "C" {
     pub fn chc_posix_io_set_deadline(state: *mut chc_posix_io, deadline_us: i64);
 }
 
-/* ---- type AST ---- */
+/* Type syntax tree */
 
 #[repr(C)]
 pub struct chc_type {
@@ -214,16 +195,9 @@ unsafe extern "C" {
     pub fn chc_type_format(t: *const chc_type, buf: *mut c_char, buf_len: usize) -> usize;
 }
 
-/* ---- columns ---- */
+/* Columns */
 
-// Public column tree, mirroring `struct chc_column` in clickhouse.h. The
-// reader allocates & owns instances (freed by chc_block_destroy); the
-// chc_build_* constructors initialize caller-owned instances over caller
-// slabs for the writer. Pointers are host byte order. Rust never reads the
-// union arms directly (the chc_column_* accessors do that for the reader,
-// chc_build_* fills them for the writer), but the layout must match exactly
-// so by-value returns from chc_build_* and Box<chc_column> nodes are sound;
-// tests/layout.rs guards it.
+// Public column layout from clickhouse.h, checked by tests/layout.rs
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct chc_column_fixed {
@@ -264,8 +238,7 @@ pub struct chc_column_lc {
     pub dict_n: usize,
 }
 
-// Anonymous union in C; named `payload` here. Exactly one arm is live,
-// selected by `layout`.
+// `layout` selects active member of anonymous C union
 #[repr(C)]
 pub union chc_column_payload {
     pub fixed: chc_column_fixed,
@@ -284,9 +257,7 @@ pub struct chc_column {
 }
 
 unsafe extern "C" {
-    // Compositional builders returning a node over caller slabs (no copy,
-    // no alloc). Children must outlive the write. Nest to match any
-    // composite the reader emits.
+    // Builders borrow input data and child nodes without allocating
     pub fn chc_build_fixed(data: *const c_void, elem_size: usize, n_rows: usize) -> chc_column;
     pub fn chc_build_string(offsets: *const u64, data: *const u8, n_rows: usize) -> chc_column;
     pub fn chc_build_nullable(null_map: *const u8, inner: *mut chc_column) -> chc_column;
@@ -322,7 +293,7 @@ unsafe extern "C" {
     pub fn chc_column_validate(c: *const chc_column, err: *mut chc_err) -> c_int;
 }
 
-/* ---- block reader ---- */
+/* Block reader */
 
 #[repr(C)]
 pub struct chc_block {
@@ -348,8 +319,7 @@ impl chc_block_opts {
 }
 
 unsafe extern "C" {
-    // Buffered reader box (wrapper.c) wrapping the implementation-private
-    // chc_in, so a BlockReader can stream successive blocks off one reader.
+    // C helpers allocate implementation-private buffered reader
     pub fn chc_rs_in_new(
         io: *mut chc_io,
         al: *const chc_alloc,
@@ -387,11 +357,9 @@ unsafe extern "C" {
     pub fn chc_block_bucket_num(b: *const chc_block) -> i32;
 }
 
-/* ---- block builder ---- */
+/* Block builder */
 
-// One block column: name, full CH type & column tree (chc_build_* output or
-// reader output for round-trip). All three slabs stay caller-owned & must
-// outlive the write.
+// Block column borrows name, type, and column tree until write completes
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct chc_block_col {
@@ -412,8 +380,7 @@ impl chc_block_col {
     }
 }
 
-// Stack builder over caller-provided chc_block_col storage. The wrapper in
-// src/builder.rs owns a Vec<chc_block_col> and keeps `cols` pointed at it.
+// Builder references caller-provided column storage
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct chc_block_builder {
@@ -459,7 +426,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/* ---- compression ---- */
+/* Compression */
 
 #[repr(C)]
 pub struct chc_codec {
@@ -524,7 +491,7 @@ unsafe extern "C" {
     pub fn chc_zstd_codec_init(out: *mut chc_codec);
 }
 
-/* ---- client (TCP) ---- */
+/* Native protocol client */
 
 #[repr(C)]
 pub struct chc_client_opts {
@@ -607,8 +574,7 @@ pub struct chc_packet_profile {
     pub calculated_rows_before_limit: u8,
 }
 
-// Payload aliases one storage selected by `kind`; mirrors the C union.
-// Reading the wrong arm is UB, so callers gate access on `kind`.
+// `kind` selects active member of C payload union
 #[repr(C)]
 pub union chc_packet_payload {
     pub block: *mut chc_block,
@@ -699,7 +665,7 @@ unsafe extern "C" {
     pub fn chc_exception_free(e: *mut chc_exception, al: *const chc_alloc);
 }
 
-/* ---- async client ---- */
+/* I/O-independent client */
 
 #[repr(C)]
 pub struct chc_async_client {

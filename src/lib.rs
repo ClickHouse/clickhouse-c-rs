@@ -1,71 +1,43 @@
-//! Rust bindings for [clickhouse-c], a header-only C client for the
-//! ClickHouse Native wire format.
+//! Rust bindings for [clickhouse-c].
 //!
-//! # Three layers
+//! Crate reads and writes ClickHouse Native blocks and implements native TCP
+//! protocol. API has three layers:
 //!
-//! 1. [`sys`] — the unsafe FFI surface. Every public function, struct, and
-//!    constant of the vendored headers, checked against them on every test
-//!    run so an upstream bump cannot drift past unnoticed. Reach here for
-//!    anything the safe layer does not wrap.
-//! 2. Safe protocol and block primitives — [`TypeAst`], [`Block`],
-//!    [`BlockReader`], [`BlockBuilder`], [`Client`], [`Codec`],
-//!    [`Allocator`]. Ownership, lifetimes, and the C destroy calls, and
-//!    nothing else: no pooling, no retries, no row mapping.
-//! 3. Optional transport adapters — [`PosixIo`] always, [`AsyncClient`]
-//!    under feature `tokio`, [`tls`] under feature `tls`. The blocking ones
-//!    sit on the [`Io`] trait, which a consumer can implement for any
-//!    transport; the async one is a byte pump over [`IolessClient`].
+//! 1. [`sys`] exposes unsafe C API.
+//! 2. [`BlockReader`], [`BlockBuilder`], [`Client`], and related types provide
+//!    safe block and protocol operations.
+//! 3. [`PosixIo`], [`AsyncClient`], and [`tls`] provide transport adapters.
 //!
 //! # Entry points
 //!
-//! * [`BlockReader`] / [`BlockBuilder`] over any [`Io`] backend: read or
-//!   write Native blocks without going through the TCP packet loop.
-//!   [`PosixIo`] covers a pipe or socket fd, which is enough to pipe
-//!   `clickhouse local --format Native`; implement [`Io`] for anything
-//!   else.
-//! * [`Client`] over a connected TCP [`PosixIo`]: full Hello / Query /
-//!   Data / EOS / Exception / Progress packet loop with optional LZ4 /
-//!   ZSTD compression.
-//! * [`IolessClient`]: the same packet loop with no I/O in it at all. The
-//!   caller submits inbound bytes and drains outbound ones, so any runtime
-//!   or event loop can drive it.
-//! * With feature `tokio`, [`AsyncClient`] over `tokio::net::TcpStream`:
-//!   [`IolessClient`] plus a byte pump, driven by the caller's task without
-//!   a worker thread. It is generic over its [`AsyncTransport`];
-//!   [`AsyncClient::boxed`] erases that type into [`BoxedAsyncClient`] when
-//!   plaintext and TLS connections have to share one type.
-//! * With feature `tls`, TLS over rustls: the blocking [`Client`] on a
-//!   [`tls::TlsIo`] backend, and [`AsyncClient::connect_tls`].
+//! * Use [`BlockReader`] and [`BlockBuilder`] for Native block streams over
+//!   any [`Io`] implementation.
+//! * Use [`Client`] for blocking native TCP protocol.
+//! * Use [`IolessClient`] to process protocol bytes with caller-managed I/O.
+//! * Enable `tokio` feature and use [`AsyncClient`] for asynchronous TCP.
+//! * Enable `tls` feature and use [`tls::TlsIo`] or
+//!   [`AsyncClient::connect_tls`] for rustls connections.
 //!
 //! # Safety model
 //!
-//! Soundness of the safe API rests on clickhouse-c, at the bundled
-//! [`UPSTREAM_REVISION`], holding the invariants its headers document.
-//! Where a cross-check costs a line it is made, and where a length could be
-//! read from two fields the smaller wins, so a C-side bug truncates rather
-//! than reading out of bounds.
+//! Safe API depends on invariants documented by bundled clickhouse-c revision,
+//! available as [`UPSTREAM_REVISION`]. Slice lengths are bounded by owning C
+//! values.
 //!
-//! Decoding bounds every slice by the owning column's own row count, so the
-//! accessors are safe on any input. Agreement *between* columns is not
-//! checked: see [`Block::validate`] before walking a peer's block by its
-//! offsets or dictionary keys.
+//! Decoding does not automatically validate relationships between nested
+//! columns. Call [`Block::validate`] before using offsets or dictionary keys
+//! from untrusted input as indexes.
 //!
-//! Self-referential C structs ([`PosixIo`], [`Codec`], `tls::TlsIo`) hand
-//! out `Pin<Box<Self>>`, because the C side stores pointers back into them.
-//!
-//! Every owning handle is `Send`. The builders are also `Sync`, since a
-//! shared reference to one only exposes reads; the connection handles are
-//! not, matching clickhouse-c's single-threaded client. [`Allocator`] is
-//! `Copy + Send + Sync`, being a stateless vtable.
+//! Types containing self-references, including [`PosixIo`], [`Codec`], and
+//! `tls::TlsIo`, return `Pin<Box<Self>>`. Owning handles implement `Send`.
+//! Connection handles do not implement `Sync`.
 //!
 //! [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
 
-// FFI wrappers mirror C arities one-to-one; arg-count refactors would
-// only push parameters into ad-hoc structs without earning anything.
+// Keep C function signatures visible in FFI wrappers
 #![allow(clippy::too_many_arguments)]
 
-/// Revision of the bundled [clickhouse-c] the bindings were written
-/// against, taken from `clickhouse-c/UPSTREAM` at build time.
+/// Bundled [clickhouse-c] revision from `clickhouse-c/UPSTREAM`.
 ///
 /// [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
 pub const UPSTREAM_REVISION: &str = env!("CHC_UPSTREAM_REVISION");

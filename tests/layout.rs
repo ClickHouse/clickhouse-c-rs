@@ -1,13 +1,7 @@
-//! ABI guard for the hand-written `#[repr(C)]` mirrors in `src/sys.rs`.
+//! ABI layout checks for `#[repr(C)]` types in `src/sys.rs`.
 //!
-//! `src/sys.rs` mirrors clickhouse-c's public by-value structs by hand
-//! (no bindgen), so a field added / removed / reordered in a vendored-header
-//! bump would drift silently into undefined behaviour at the FFI boundary —
-//! `build.rs` only re-syncs enum / `#define` constants, not struct geometry.
-//!
-//! `src/layout_probe.c` is compiled against the genuine headers and exposes
-//! each struct's `sizeof` / `_Alignof` / `offsetof`. Here we assert they
-//! match Rust's view, turning that drift into a test failure.
+//! `src/layout_probe.c` reports sizes, alignments, and field offsets from C
+//! headers. Tests compare them with hand-written Rust structures.
 
 use core::mem::{align_of, offset_of, size_of};
 
@@ -562,9 +556,7 @@ fn chc_query_opts_matches_c() {
 
 #[test]
 fn chc_packet_matches_c() {
-    // Outer packet: kind + the union. Matching size, align, and union
-    // offset pin the (anonymous, unnamed-in-C) union's size transitively;
-    // the arm structs below verify the union's payload layout directly.
+    // Check packet union position and each payload structure
     layout!(
         sys::chc_packet,
         chc_rs_size_chc_packet,

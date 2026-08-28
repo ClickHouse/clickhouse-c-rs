@@ -1,46 +1,40 @@
-//! Compression codec handles.
+//! Compression codecs for native protocol frames.
 //!
-//! [`Codec::lz4`] and [`Codec::zstd`] populate a [`Codec`] from
-//! clickhouse-compression.h's adapters, each behind its own feature.
-//! [`Codec::empty`] plus [`Codec::raw_mut`], or [`Codec::from_raw`], build one
-//! from caller-supplied callbacks and stay available with no features at
-//! all -- linking a compression library is a choice, not a prerequisite for
-//! having a codec.
+//! Built-in LZ4 and Zstandard codecs require corresponding crate features.
+//! [`Codec::empty`] and [`Codec::from_raw`] support custom implementations.
 
 use core::pin::Pin;
 
 use crate::sys;
 
-/// Frame compression negotiated for a connection.
+/// Compression algorithm used for native protocol frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Compression {
-    /// Blocks travel uncompressed. Needs no [`Codec`].
+    /// Disables compression and does not require a [`Codec`].
     #[default]
     None = sys::CHC_COMP_NONE,
-    /// Needs a codec with the `lz4_*` slots filled, eg [`Codec::lz4`].
+    /// Uses LZ4 and requires corresponding callbacks, such as [`Codec::lz4`].
     Lz4 = sys::CHC_COMP_LZ4,
-    /// Needs a codec with the `zstd_*` slots filled, eg [`Codec::zstd`].
+    /// Uses Zstandard and requires corresponding callbacks, such as
+    /// [`Codec::zstd`].
     Zstd = sys::CHC_COMP_ZSTD,
 }
 
-/// Owns a `chc_codec`. Constructed via the codec-specific factory
-/// ([`Codec::lz4`], [`Codec::zstd`]), [`Codec::empty`] plus
-/// [`Codec::raw_mut`], or [`Codec::from_raw`].
+/// Compression callbacks used by clickhouse-c.
 ///
-/// The struct is pinned because compression code calls back into the
-/// function-pointer table by address.
+/// Value is pinned because C code retains address of callback table.
 pub struct Codec {
     raw: sys::chc_codec,
     _pin: core::marker::PhantomPinned,
 }
 
 impl Codec {
-    /// A codec with no callbacks installed.
+    /// Creates a codec without compression callbacks.
     ///
-    /// Only usable with [`Compression::None`] until [`raw_mut`] fills the
-    /// slots a codec needs; [`Client::init`](crate::Client::init) rejects the
-    /// mismatch rather than reaching a null call.
+    /// Codec only supports [`Compression::None`] until required callbacks are
+    /// installed through [`raw_mut`]. [`Client::init`](crate::Client::init)
+    /// rejects missing callbacks.
     ///
     /// [`raw_mut`]: Codec::raw_mut
     pub fn empty() -> Pin<Box<Self>> {
@@ -58,15 +52,14 @@ impl Codec {
         })
     }
 
-    /// Take a fully filled `chc_codec`.
+    /// Creates a codec from a raw callback table.
     ///
     /// # Safety
     ///
-    /// Same contract as [`raw_mut`](Codec::raw_mut): every installed function
-    /// pointer must match its field's signature, the slots required by the
-    /// [`Compression`] this codec is paired with must all be set, and any
-    /// `ud` must outlive the [`Codec`] and be dereferenceable from every
-    /// thread the codec is used from.
+    /// Each function pointer must match corresponding field signature. All
+    /// callbacks required by selected [`Compression`] must be present. User
+    /// data referenced by `ud` must remain valid while codec exists and from
+    /// every thread that uses codec.
     pub unsafe fn from_raw(raw: sys::chc_codec) -> Pin<Box<Self>> {
         Box::pin(Self {
             raw,
@@ -74,7 +67,7 @@ impl Codec {
         })
     }
 
-    /// clickhouse-compression.h's LZ4 adapter over the system `liblz4`.
+    /// Creates built-in LZ4 codec backed by system liblz4.
     #[cfg(feature = "lz4")]
     pub fn lz4() -> Pin<Box<Self>> {
         let mut b = Self::empty();
@@ -85,7 +78,7 @@ impl Codec {
         b
     }
 
-    /// clickhouse-compression.h's ZSTD adapter over the system `libzstd`.
+    /// Creates built-in Zstandard codec backed by system libzstd.
     #[cfg(feature = "zstd")]
     pub fn zstd() -> Pin<Box<Self>> {
         let mut b = Self::empty();
@@ -96,24 +89,18 @@ impl Codec {
         b
     }
 
-    /// Borrow the underlying `chc_codec` for manual fills (e.g. wiring a
-    /// custom allocator-bound compression implementation).
+    /// Returns mutable access to raw callback table.
     ///
     /// # Safety
     ///
-    /// Caller installs raw function pointers the C library will invoke
-    /// without further checks. To stay sound:
+    /// C library calls installed function pointers without validation.
     ///
-    /// * Each installed function pointer must match the exact signature
-    ///   of the corresponding `chc_codec` field.
-    /// * For any [`Compression`] the codec will be paired with at the
-    ///   [`Client`](crate::Client), the relevant fields must be set —
-    ///   e.g. `Compression::Lz4` needs `lz4_compress`, `lz4_decompress`,
-    ///   `lz4_bound`. Leaving a required slot `None` reaches a null
-    ///   call.
-    /// * Any `ud` pointer stored on the codec must outlive the
-    ///   [`Codec`] and remain dereferenceable from every thread the
-    ///   codec is used from.
+    /// * Each function pointer must match corresponding field signature.
+    /// * All callbacks required by selected [`Compression`] must be present.
+    ///   For example, LZ4 requires `lz4_compress`, `lz4_decompress`, and
+    ///   `lz4_bound`.
+    /// * Data referenced by `ud` must remain valid while codec exists and from
+    ///   every thread that uses codec.
     pub unsafe fn raw_mut(self: Pin<&mut Self>) -> &mut sys::chc_codec {
         unsafe { &mut self.get_unchecked_mut().raw }
     }
@@ -123,9 +110,7 @@ impl Codec {
         &self.raw
     }
 
-    /// Whether every slot `compression` reaches is filled. The bound
-    /// callback sizes the compressed frame before compressing, so leaving it
-    /// out is as fatal as leaving out the compressor.
+    /// Returns whether all callbacks required by `compression` are present.
     pub(crate) fn supports(self: Pin<&Self>, compression: Compression) -> bool {
         match compression {
             Compression::None => true,
@@ -145,8 +130,7 @@ impl Codec {
 
 unsafe impl Send for Codec {}
 
-/// City Hash 128 helper. Returns `(lo, hi)` matching the on-wire
-/// frame-checksum layout.
+/// Calculates CityHash128 and returns low and high words in wire order.
 pub fn cityhash128(data: &[u8]) -> (u64, u64) {
     let mut lo = 0u64;
     let mut hi = 0u64;
@@ -171,8 +155,7 @@ mod tests {
         assert!(!codec.as_ref().supports(Compression::Zstd));
     }
 
-    // A compressor with no bound callback would reach a null call while
-    // sizing the frame, so it must not count as support.
+    // Frame allocation requires bound callback before compression
     #[test]
     fn missing_bound_callback_is_not_support() {
         let mut codec = Codec::empty();
@@ -187,7 +170,7 @@ mod tests {
         assert!(codec.as_ref().supports(Compression::Lz4));
     }
 
-    // Never called: `supports` only inspects which slots are filled.
+    // Test only checks whether callback is present
     unsafe extern "C" fn stub_compress(
         _ud: *mut c_void,
         _src: *const c_void,

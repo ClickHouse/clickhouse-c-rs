@@ -1,16 +1,5 @@
-/*
- * layout_probe.c -- exposes sizeof / _Alignof / offsetof for every
- * #[repr(C)] struct hand-mirrored in src/sys.rs. tests/layout.rs calls
- * these and compares against Rust's mem::{size_of,align_of,offset_of!}, so a
- * field added/removed/reordered in a vendored-header bump fails a test
- * instead of silently corrupting memory at the FFI boundary.
- *
- * Declarations only -- no CHC_IMPLEMENTATION (that single TU is wrapper.c).
- * The mirrored structs are all public POD in the headers' declaration
- * section, so their bodies are complete here. chc_io and chc_posix_io are
- * both mirrored in Rust (src/io.rs builds the pair, src/tls.rs builds a
- * chc_io directly), so both are probed below.
- */
+/* Expose C structure sizes, alignments, and field offsets for tests/layout.rs
+ * No implementations are included because wrapper.c provides them */
 
 #include <stddef.h>
 
@@ -55,10 +44,7 @@ CHC_RS_FIELD(chc_block_opts, has_block_info)
 CHC_RS_FIELD(chc_block_opts, has_custom_serialization)
 CHC_RS_FIELD(chc_block_opts, read_buffer_bytes)
 
-/* chc_column: layout + n_rows + an anonymous union. Rust never reads the
- * union arms (chc_build_* fills them, the chc_column_* accessors read them),
- * so only overall size/align and the two named fields plus the union offset
- * need pinning; the size check transitively catches any arm-size drift. */
+/* Check public fields and anonymous union position */
 CHC_RS_LAYOUT(chc_column)
 CHC_RS_FIELD(chc_column, layout)
 CHC_RS_FIELD(chc_column, n_rows)
@@ -137,14 +123,10 @@ CHC_RS_FIELD(chc_query_opts, n_params)
 
 CHC_RS_LAYOUT(chc_packet)
 CHC_RS_FIELD(chc_packet, kind)
-/* payload is an anonymous union upstream; its first member sits at the
- * union's offset, which Rust mirrors as the named `payload` field. */
+/* First union member provides offset of Rust `payload` field */
 size_t chc_rs_off_chc_packet__payload(void) { return offsetof(chc_packet, block); }
 
-/* Union arms: anonymous structs inside chc_packet's union, mirrored in Rust
- * as the standalone chc_packet_progress / chc_packet_profile. Sizes via the
- * member-of-null idiom (unevaluated, no deref); field offsets absolute from
- * the packet base to compare against payload-offset + in-struct offset. */
+/* Check anonymous progress and profile structures mirrored as Rust types */
 size_t chc_rs_size_progress(void)  { return sizeof(((chc_packet *) 0)->progress); }
 size_t chc_rs_off_progress_rows(void)          { return offsetof(chc_packet, progress.rows); }
 size_t chc_rs_off_progress_bytes(void)         { return offsetof(chc_packet, progress.bytes); }

@@ -1,6 +1,6 @@
 [package]
 name = "clickhouse-c-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust bindings for clickhouse-c, the header-only C client for the ClickHouse Native wire format"
@@ -10,9 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 keywords = ["clickhouse", "database", "native", "ffi", "bindings"]
 categories = ["database", "api-bindings", "external-ffi-bindings"]
-# Bundled clickhouse-c exports global C symbols. `links` makes Cargo reject a
-# dependency graph holding two copies, which would be a duplicate-symbol link
-# error or, worse, silent interposition of mismatched ABIs.
+# Prevent multiple copies of global clickhouse-c symbols in dependency graph
 links = "clickhouse-c"
 include = [
     "/build.rs",
@@ -33,10 +31,7 @@ include = [
 name = "clickhouse_c"
 path = "src/lib.rs"
 
-# Servers negotiate LZ4 in practice, so the common build wants it and it stays
-# on by default; it links the system liblz4. `default-features = false` drops
-# to a build needing only a C compiler and libc, matching what
-# `#include "clickhouse.h"` alone costs in C.
+# Enable common LZ4 configuration by default, disable default features to avoid codec libraries
 [features]
 default = ["lz4"]
 lz4 = []

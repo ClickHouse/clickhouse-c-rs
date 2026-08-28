@@ -1,13 +1,8 @@
-//! TLS coverage (feature `tls`) against a spawned `clickhouse server`
-//! listening on a secure native port with a self-signed cert.
+//! TLS tests using temporary ClickHouse server and local certificate authority.
 //!
-//! The cert is generated with `openssl` and pinned into the rustls root
-//! store, so verification (chain + SNI hostname `localhost`) is exercised
-//! for real rather than disabled. Skips when `clickhouse` or `openssl` is
-//! not on PATH.
-//!
-//! Covers both the blocking `Client` over `tls::TlsIo` and the async
-//! `AsyncClient::connect_tls`.
+//! Tests verify certificate chain and SNI hostname for blocking and
+//! asynchronous clients. Tests skip when `clickhouse` or `openssl` is
+//! unavailable.
 
 mod common;
 
@@ -43,16 +38,14 @@ fn openssl(args: &[&std::ffi::OsStr]) -> TestResult {
     Ok(())
 }
 
-/// Generate a CA + a leaf server cert it signs. Returns (leaf cert PEM,
-/// leaf key PEM, CA cert DER). The leaf is a proper end-entity cert
-/// (`CA:FALSE`, `serverAuth` EKU, SAN `localhost`/`127.0.0.1`) so rustls
-/// accepts it; pinning the CA DER as the sole root exercises real chain +
-/// hostname verification rather than disabling it.
+/// Creates certificate authority and signed server certificate.
+///
+/// Returns server certificate PEM, server key PEM, and CA certificate DER.
 fn make_cert(dir: &Path) -> TestResult<(PathBuf, PathBuf, Vec<u8>)> {
     let p = |n: &str| dir.join(n);
     let oss = |path: &Path| path.as_os_str().to_owned();
 
-    // Leaf extensions written to a config file (no shell process subst).
+    // Write server certificate extensions for OpenSSL
     let ext = p("leaf.ext");
     std::fs::write(
         &ext,
@@ -62,7 +55,7 @@ fn make_cert(dir: &Path) -> TestResult<(PathBuf, PathBuf, Vec<u8>)> {
          subjectAltName=DNS:localhost,IP:127.0.0.1\n",
     )?;
 
-    // Self-signed CA.
+    // Generate self-signed certificate authority
     openssl(&[
         "req".as_ref(),
         "-x509".as_ref(),
@@ -79,7 +72,7 @@ fn make_cert(dir: &Path) -> TestResult<(PathBuf, PathBuf, Vec<u8>)> {
         &oss(&p("ca.pem")),
     ])?;
 
-    // Leaf key + CSR.
+    // Generate server key and signing request
     openssl(&[
         "req".as_ref(),
         "-newkey".as_ref(),
@@ -93,7 +86,7 @@ fn make_cert(dir: &Path) -> TestResult<(PathBuf, PathBuf, Vec<u8>)> {
         &oss(&p("leaf.csr")),
     ])?;
 
-    // CA signs the leaf with the EE extensions.
+    // Sign server certificate with certificate authority
     openssl(&[
         "x509".as_ref(),
         "-req".as_ref(),
@@ -112,7 +105,7 @@ fn make_cert(dir: &Path) -> TestResult<(PathBuf, PathBuf, Vec<u8>)> {
         &oss(&p("cert.pem")),
     ])?;
 
-    // CA DER for the client root store.
+    // Convert CA certificate for rustls root store
     openssl(&[
         "x509".as_ref(),
         "-in".as_ref(),
@@ -127,7 +120,7 @@ fn make_cert(dir: &Path) -> TestResult<(PathBuf, PathBuf, Vec<u8>)> {
     Ok((p("cert.pem"), p("key.pem"), der))
 }
 
-/// Shared server plus the CA the test pinned into its client config.
+/// Temporary TLS server and trusted certificate authority.
 struct TlsServer {
     inner: ChServer,
     ca_der: Vec<u8>,
@@ -150,7 +143,7 @@ impl TlsServer {
     }
 }
 
-/// rustls config pinning the test CA as the sole root.
+/// Creates rustls configuration with test CA as only root.
 fn pinned_config(server: &TlsServer) -> TestResult<Arc<rustls::ClientConfig>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(rustls::pki_types::CertificateDer::from(
@@ -216,8 +209,7 @@ async fn sync_tls_roundtrip() -> TestResult {
     let server = TlsServer::spawn()?;
     let config = pinned_config(&server)?;
 
-    // Blocking Client over TlsIo. No `.await` between connect and drain,
-    // so the !Sync client never crosses an await point.
+    // Complete blocking client work without crossing await point
     let tcp = TcpStream::connect(("127.0.0.1", server.secure_port()))?;
     tcp.set_nodelay(true).ok();
     let io = tls::TlsIo::connect(tcp, "localhost", config)?;

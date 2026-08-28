@@ -1,6 +1,6 @@
-//! Smoke test that round-trips a built block through `clickhouse local`.
+//! Native block round-trip tests using `clickhouse local`.
 //!
-//! Skipped when `clickhouse` is not on PATH so CI without it stays green.
+//! Tests skip when `clickhouse` is unavailable.
 
 use std::io::Read;
 use std::os::fd::AsFd;
@@ -59,8 +59,7 @@ fn write_then_read_back_uint32() {
     bb.append("x", ty.view(), &col).expect("append");
     bb.write(io.as_mut(), BlockOpts::default()).expect("write");
 
-    // Drop the borrowing PosixIo first, then the stdin handle, which
-    // closes the pipe and lets clickhouse local see EOF.
+    // Close pipe after dropping borrowed transport
     drop(io);
     drop(stdin);
 
@@ -68,15 +67,11 @@ fn write_then_read_back_uint32() {
     stdout.read_to_end(&mut buf).expect("read stdout");
     let status = child.wait().expect("wait");
     assert!(status.success(), "clickhouse local exit: {status:?}");
-    // clickhouse local emits the SELECT result back as Native; for sanity
-    // just confirm something came through and the SQL didn't error.
+    // Confirm query produced decodable Native output
     assert!(!buf.is_empty(), "no stdout from clickhouse local");
 }
 
-/// Round-trip a `Tuple(a UInt32, b String)` column through `clickhouse
-/// local`: our `ColumnBuilder::tuple` bytes must be wire-compatible enough
-/// for CH to accept them, and CH's re-emitted Native must decode back through
-/// `Column::tuple_child`. Named-tuple field names survive both directions.
+/// Verifies named tuple survives write and read through `clickhouse local`.
 #[test]
 fn write_then_read_back_tuple() {
     if !clickhouse_on_path() {
@@ -113,8 +108,7 @@ fn write_then_read_back_tuple() {
     let (b_offsets, b_data) = string_column(&["x", "yy", "zzz"]);
     let b_col = ColumnBuilder::string(&b_offsets, &b_data, 3).expect("string leaf");
 
-    // Tuple aliases a scratch `*mut chc_column` array; keep it and the child
-    // nodes borrowed until the write.
+    // Tuple borrows pointer storage and child nodes until write
     let children = [a_col, b_col];
     let mut ptrs = [std::ptr::null_mut(); 2];
     let tuple = ColumnBuilder::tuple(&children, &mut ptrs).expect("tuple");
@@ -124,10 +118,9 @@ fn write_then_read_back_tuple() {
     bb.append("t", ty.view(), &tuple).expect("append tuple");
     bb.write(io.as_mut(), BlockOpts::default()).expect("write");
     drop(io);
-    drop(stdin); // EOF for the child
+    drop(stdin); // Signal EOF to child process
 
-    // Decode CH's re-emitted Native off stdout. The block is tiny, so writing
-    // it all before reading cannot deadlock the pipe.
+    // Decode Native output after completing small input write
     let mut read_io = PosixIo::new(stdout.as_fd());
     let mut reader =
         BlockReader::new(read_io.as_mut(), alloc, BlockOpts::default()).expect("reader");

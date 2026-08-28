@@ -1,6 +1,6 @@
-//! Tokio async TCP client coverage over spawned `clickhouse server`.
+//! Tokio client tests using a temporary ClickHouse server.
 //!
-//! Skips when `clickhouse` is not on PATH.
+//! Tests skip when `clickhouse` is unavailable.
 
 mod common;
 
@@ -113,8 +113,7 @@ async fn async_bad_sql_returns_exception() -> TestResult {
     }
 }
 
-/// A consumer wanting plaintext or TLS behind one type boxes the
-/// transport; the connection keeps working across the erasure.
+/// Verifies transport erasure preserves active connection.
 #[tokio::test(flavor = "current_thread")]
 async fn async_boxed_client_runs_query() -> TestResult {
     if !clickhouse_on_path() {

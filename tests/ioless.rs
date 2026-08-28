@@ -1,9 +1,6 @@
-//! Drives the native protocol against a real server with no runtime at all:
-//! a blocking `std::net::TcpStream` and a hand-written byte pump.
+//! I/O-independent client tests using blocking TCP transport.
 //!
-//! The point is not that anyone would write it this way, but that everything
-//! another runtime needs is public. Nothing here touches `tokio`, `sys`, or
-//! `unsafe`.
+//! Tests use only public safe API required by alternate runtimes.
 
 mod common;
 
@@ -15,11 +12,11 @@ use clickhouse_c::{
 };
 use common::{ChServer, TestResult, clickhouse_on_path};
 
-/// The whole transport contract: push queued bytes out, pull bytes in.
+/// Transfers queued output and submits received input.
 struct Pump {
     sock: TcpStream,
     buf: Vec<u8>,
-    /// Total bytes written, to prove partial writes are exercised.
+    /// Total bytes accepted by transport.
     written: usize,
 }
 
@@ -32,8 +29,7 @@ impl Pump {
         }
     }
 
-    /// Write at most `limit` bytes per call, so `consume_out` is driven with
-    /// partial counts rather than always draining the queue in one go.
+    /// Writes at most `limit` bytes to exercise partial output consumption.
     fn flush(&mut self, core: &mut IolessClient, limit: usize) -> Result<()> {
         loop {
             let pending = core.pending_out();
@@ -58,8 +54,7 @@ impl Pump {
     }
 }
 
-/// Deliberately tiny read and write chunks: the parser has to resume
-/// mid-packet, which is the whole reason the ioless API exists.
+/// Creates byte pump with small chunks to exercise incremental parsing.
 const CHUNK: usize = 7;
 
 fn drive<T>(
@@ -73,9 +68,7 @@ fn drive<T>(
                 pump.flush(core, CHUNK)?;
                 return Ok(value);
             }
-            // Flush before reading: a step that needs input has usually just
-            // queued the bytes the server is waiting on, and skipping this
-            // deadlocks both sides.
+            // Send queued protocol output before blocking for input
             Step::NeedsInput => {
                 pump.flush(core, CHUNK)?;
                 pump.fill(core)?;
@@ -99,8 +92,7 @@ fn a_hand_written_pump_runs_a_query() -> TestResult {
         Allocator::stdlib(),
         None,
     )?;
-    // Pre-handshake the slot exists but is empty; the revision is seeded
-    // with what the client asked for.
+    // Initial server information contains requested revision
     let seeded = core.server_info().expect("slot always exists");
     assert!(seeded.name.is_empty());
     assert!(seeded.revision > 0);
@@ -134,8 +126,7 @@ fn a_hand_written_pump_runs_a_query() -> TestResult {
 
     assert_eq!(total_rows, 2000);
     assert_eq!(sum, (0..2000u64).sum::<u64>());
-    // 2000 rows past a 7-byte read buffer means the parser resumed mid-block
-    // many times over.
+    // Small input chunks force parser to resume within block
     assert!(pump.written > 0);
     Ok(())
 }
@@ -156,8 +147,7 @@ fn a_hand_written_pump_runs_an_insert() -> TestResult {
     drive(&mut core, &mut pump, |c| c.handshake())?;
 
     core.send_query("INSERT INTO ioless (n) VALUES", None)?;
-    // The server answers with a header block describing the target, though
-    // TableColumns and Progress can arrive first.
+    // Wait for INSERT structure Data block
     loop {
         match drive(&mut core, &mut pump, |c| c.recv_event())? {
             Event::Data(header) => {
@@ -192,8 +182,7 @@ fn a_hand_written_pump_runs_an_insert() -> TestResult {
     Ok(())
 }
 
-/// `IolessClient` runs the same `ClientOpts` validation as the blocking
-/// client, before any byte is queued.
+/// Verifies client options before protocol output is queued.
 #[test]
 fn opts_are_validated_without_a_connection() {
     let Err(err) = IolessClient::new(
@@ -206,8 +195,7 @@ fn opts_are_validated_without_a_connection() {
     assert_eq!(err.kind, clickhouse_c::ErrorKind::Usage);
 }
 
-/// A fresh machine has queued its Hello but read nothing, so `pending_out` is
-/// non-empty and `recv_event` needs input. No socket involved.
+/// Verifies initial Hello output and input requirement without transport.
 #[test]
 fn a_fresh_machine_queues_hello_and_waits() {
     let mut core =
@@ -218,10 +206,10 @@ fn a_fresh_machine_queues_hello_and_waits() {
     ));
     assert!(!core.pending_out().is_empty(), "Hello should be queued");
 
-    // Consuming more than is queued is clamped, not a panic.
+    // Consumption beyond queue length removes all output
     let queued = core.pending_out().len();
     core.consume_out(queued * 2);
     assert!(core.pending_out().is_empty());
 
-    let _ = QuerySetting::TEXT_TYPE_NAMES; // settings are a blocking-client feature
+    let _ = QuerySetting::TEXT_TYPE_NAMES; // I/O-independent API does not support settings
 }

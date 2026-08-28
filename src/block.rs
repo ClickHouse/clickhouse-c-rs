@@ -1,8 +1,7 @@
-//! Owned [`Block`] and borrowed [`Column`] views.
+//! Native block reading and column access.
 //!
-//! A block is returned by [`BlockReader::read`] (for a free-standing
-//! `chc_io`, e.g. piping `clickhouse local`'s stdout) or by
-//! `Packet::take_block` (TCP path).
+//! [`BlockReader`] reads block streams from an [`Io`] implementation. TCP
+//! clients also return [`Block`] values for Data packets.
 
 use core::pin::Pin;
 use core::ptr::NonNull;
@@ -14,35 +13,28 @@ use crate::io::Io;
 use crate::sys;
 use crate::types::TypeRef;
 
-/// Physical shape of a decoded column.
+/// Storage layout of a decoded column.
 ///
-/// Deliberately far smaller than [`Kind`](crate::Kind): many logical
-/// ClickHouse types share one layout, and the type is what tells them apart.
-/// Read the layout to know how to walk the bytes, the
-/// [`column_type`](Block::column_type) to know what they mean.
+/// Several ClickHouse types can share a layout. Use
+/// [`Block::column_type`] to determine logical type.
 #[derive(Clone, Copy, Debug)]
 #[repr(i32)]
 pub enum ColumnLayout {
-    /// Contiguous little-endian elements of one width. Every scalar lands
-    /// here: integers, floats, `Bool`, `Date`, `DateTime`, `Decimal`,
-    /// `UUID`, `IPv4`/`IPv6`, `FixedString`, `Enum8`/`Enum16`, `Interval`.
+    /// Fixed-width values stored as contiguous little-endian bytes.
     Fixed = sys::CHC_COL_FIXED,
-    /// Offsets plus a byte slab. `String`, and also `JSON` / `Object` under
-    /// their string serialization.
+    /// Offsets and byte data used by `String` and string-encoded JSON types.
     String = sys::CHC_COL_STRING,
-    /// Null map plus a dense inner column: `Nullable(T)`.
+    /// Null map and dense inner column used by `Nullable(T)`.
     Nullable = sys::CHC_COL_NULLABLE,
-    /// Offsets plus an element column: `Array(T)`, and `Map(K, V)` as
+    /// Offsets and element column used by `Array(T)`, and `Map(K, V)` as
     /// `Array(Tuple(K, V))`.
     Array = sys::CHC_COL_ARRAY,
-    /// Parallel child columns: `Tuple`, `Nested`, the geo types
-    /// (`Point`/`Ring`/`Polygon`/`MultiPolygon`), and `QBit` as one fixed
-    /// bit-plane column per element bit.
+    /// Parallel child columns used by tuples, nested values, geographic
+    /// types, and QBit values.
     Tuple = sys::CHC_COL_TUPLE,
-    /// Keys plus a dictionary column: `LowCardinality(T)`.
+    /// Keys and dictionary column used by `LowCardinality(T)`.
     LowCardinality = sys::CHC_COL_LOW_CARDINALITY,
-    /// No values at all: `Nothing`, and the inner column of an
-    /// all-NULL `Nullable(Nothing)`.
+    /// Empty storage used by `Nothing` and `Nullable(Nothing)` inner columns.
     Nothing = sys::CHC_COL_NOTHING,
 }
 
@@ -61,22 +53,18 @@ impl ColumnLayout {
     }
 }
 
-/// Which optional prefixes the block frames on the wire carry.
+/// Options that describe Native block framing.
 ///
-/// The Native *format* (what `clickhouse local` writes) and the Native
-/// *protocol* (what a TCP connection carries) differ by a couple of headers,
-/// and the protocol's depend on the negotiated server revision. Get these
-/// wrong and decoding desynchronizes on the first block.
+/// Native files and native TCP protocol use different optional fields. TCP
+/// values depend on negotiated server revision. Incorrect values prevent
+/// block decoding.
 #[derive(Clone, Copy, Default)]
 pub struct BlockOpts {
-    /// TCP path (server_revision >= 51903) ships an 8-byte BlockInfo prefix.
-    /// `clickhouse local` does not.
+    /// Includes 8-byte `BlockInfo` prefix used by TCP revision 51903 and later.
     pub has_block_info: bool,
-    /// TCP path (server_revision >= 54454) ships a 1-byte
-    /// has_custom_serialization flag after each column type. `clickhouse
-    /// local` does not.
+    /// Includes custom serialization flag used by TCP revision 54454 and later.
     pub has_custom_serialization: bool,
-    /// Internal read-buffer size. 0 → 8 KiB default.
+    /// Read buffer size in bytes. Zero selects 8 KiB default.
     pub read_buffer_bytes: usize,
 }
 
@@ -90,19 +78,20 @@ impl BlockOpts {
     }
 }
 
-/// Owning handle to a decoded `chc_block *`. `Drop` frees through the
-/// same allocator used at construction.
+/// Decoded Native block.
+///
+/// Value releases its memory with allocator used during decoding.
 pub struct Block {
     raw: NonNull<sys::chc_block>,
     alloc: Allocator,
 }
 
 impl Block {
-    /// Wrap a raw block pointer with an allocator and take ownership.
+    /// Takes ownership of a raw block pointer.
     ///
     /// # Safety
-    /// The caller must own `raw` and must not use it after this call. The
-    /// `alloc` must match the one the block was allocated with.
+    /// Caller must own `raw` and stop using it after this call. `alloc` must
+    /// match allocator used to create block.
     pub(crate) unsafe fn from_raw(raw: *mut sys::chc_block, alloc: Allocator) -> Option<Self> {
         NonNull::new(raw).map(|raw| Self { raw, alloc })
     }
@@ -115,10 +104,7 @@ impl Block {
         unsafe { sys::chc_block_n_columns(self.raw.as_ptr().cast_const()) }
     }
 
-    /// Column name as the raw bytes the C library copied from the wire.
-    /// UTF-8 is not validated; consumers that need a `&str` should run
-    /// the bytes through [`core::str::from_utf8`] or
-    /// `String::from_utf8_lossy`.
+    /// Returns column name bytes without UTF-8 validation.
     pub fn column_name(&self, i: usize) -> Option<&[u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_block_column_name(self.raw.as_ptr().cast_const(), i, &mut len) };
@@ -153,18 +139,13 @@ impl Block {
         }
     }
 
-    /// Validate every column with [`Column::validate`].
+    /// Validates structural relationships within every column.
     ///
-    /// **Trust boundary.** Decoding is bounded by each column's own row
-    /// count, so the accessors here are safe on any input. What decoding
-    /// does *not* check is agreement *between* columns -- array offsets
-    /// non-decreasing, LowCardinality keys inside the dictionary. Code that
-    /// walks a block using those offsets or keys as indices should call this
-    /// first on anything a peer sent; skipping it turns a forged block into
-    /// a panic or nonsense values in consumer code.
+    /// Validation checks array offset order and LowCardinality dictionary
+    /// indexes. Call this method before using offsets or keys from untrusted
+    /// data as indexes.
     ///
-    /// Opt-in because the cost is proportional to row count and a caller
-    /// reading only, say, a fixed column pays for nothing.
+    /// Runtime cost is proportional to row count.
     pub fn validate(&self) -> Result<()> {
         for i in 0..self.n_columns() {
             if let Some(col) = self.column(i) {
@@ -174,13 +155,13 @@ impl Block {
         Ok(())
     }
 
-    /// Server-set flag marking a block truncated by `max_rows_to_group_by`
+    /// Returns server flag marking a block truncated by `max_rows_to_group_by`
     /// with `group_by_overflow_mode = 'any'`.
     pub fn is_overflows(&self) -> bool {
         unsafe { sys::chc_block_is_overflows(self.raw.as_ptr().cast_const()) }
     }
 
-    /// Two-level aggregation bucket, or -1 outside that path.
+    /// Returns two-level aggregation bucket, or -1 when not applicable.
     pub fn bucket_num(&self) -> i32 {
         unsafe { sys::chc_block_bucket_num(self.raw.as_ptr().cast_const()) }
     }
@@ -194,33 +175,25 @@ impl Drop for Block {
 
 unsafe impl Send for Block {}
 
-/// Streams successive [`Block`]s off any [`Io`] backend: a pipe from
-/// `clickhouse local`, a raw block socket, an in-memory buffer. Holds a
-/// single buffered reader so bytes read past a block boundary stay buffered
-/// for the next [`read`]; a fresh reader per block would drop that over-read
-/// tail and lose every block after the first.
+/// Reads consecutive Native [`Block`] values from an [`Io`] implementation.
 ///
-/// [`read`]: BlockReader::read
+/// Reader retains buffered bytes between calls to [`read`](Self::read).
 pub struct BlockReader<'io, I: Io + ?Sized> {
     raw: NonNull<sys::chc_in>,
-    // Keeps the pinned backend borrowed & fixed: `raw` holds a chc_io pointer
-    // into it for the reader's lifetime.
+    // `raw` retains pointer into pinned I/O value
     _io: Pin<&'io mut I>,
-    // chc_in_init stashes `in->al = al`, so the C side keeps calling through
-    // this exact address on every refill and on free. Boxed to give it one
-    // that outlives the constructor and survives moves of `Self`, as
-    // `Client` does for the same reason. Passing `&alloc` of a by-value
-    // parameter instead leaves C reading a dead stack slot.
+    // C reader retains allocator address until destruction
     alloc: Box<Allocator>,
     opts: sys::chc_block_opts,
 }
 
 impl<'io, I: Io + ?Sized> BlockReader<'io, I> {
-    /// Open a reader over `io`. `opts` matches the block frames on the wire
-    /// (`BlockOpts::default()` for `clickhouse local`).
+    /// Creates a reader using framing described by `opts`.
+    ///
+    /// Use [`BlockOpts::default`] for output from `clickhouse local`.
     pub fn new(mut io: Pin<&'io mut I>, alloc: Allocator, opts: BlockOpts) -> Result<Self> {
         let raw_opts = opts.to_raw();
-        // Box before handing the address to C: the reader retains it.
+        // C reader retains this address
         let alloc = Box::new(alloc);
         let mut raw: *mut sys::chc_in = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
@@ -243,8 +216,7 @@ impl<'io, I: Io + ?Sized> BlockReader<'io, I> {
         })
     }
 
-    /// Decode the next block. Returns `Ok(None)` on a clean EOF at a block
-    /// boundary.
+    /// Decodes next block. Returns `None` for EOF at a block boundary.
     pub fn read(&mut self) -> Result<Option<Block>> {
         let mut out: *mut sys::chc_block = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
@@ -271,7 +243,7 @@ impl<I: Io + ?Sized> Drop for BlockReader<'_, I> {
     }
 }
 
-/// Borrowed view into one column of a [`Block`].
+/// Borrowed view of a block column.
 #[derive(Clone, Copy)]
 pub struct Column<'b> {
     pub(crate) raw: *const sys::chc_column,
@@ -287,19 +259,17 @@ impl<'b> Column<'b> {
         unsafe { sys::chc_column_n_rows(self.raw) }
     }
 
-    /// Enforce the cross-field invariants ClickHouse checks on its own
-    /// native deserialization path, recursing through nested columns:
-    /// array offsets non-decreasing, LowCardinality keys within dict
-    /// range. A forged column can otherwise drive reads past inner-column
-    /// bounds. Returns [`ErrorKind::Protocol`](crate::ErrorKind::Protocol)
-    /// on the first violation.
+    /// Validates array offsets and LowCardinality dictionary indexes.
+    ///
+    /// Validation includes nested columns and returns
+    /// [`ErrorKind::Protocol`](crate::ErrorKind::Protocol) for invalid data.
     pub fn validate(&self) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_column_validate(self.raw, &mut err) };
         check(rc, &err)
     }
 
-    /// Returns `(elem_size, bytes)`. Bytes are little-endian on the wire.
+    /// Returns element width and little-endian data for a fixed-width column.
     pub fn fixed(&self) -> Option<(usize, &'b [u8])> {
         let Some(ColumnLayout::Fixed) = self.layout() else {
             return None;
@@ -314,11 +284,11 @@ impl<'b> Column<'b> {
         Some((elem_size, bytes))
     }
 
-    /// String column: `(offsets, data)`. `offsets[i]` is the cumulative
-    /// end of row `i` in `data` (exclusive ends, host byte order).
+    /// Returns offsets and bytes for a string column.
     ///
-    /// Also the physical shape of `JSON` / `Object` and of a
-    /// LowCardinality dictionary.
+    /// Each offset is exclusive end of corresponding row in host byte order.
+    /// Layout also represents string-encoded JSON and LowCardinality
+    /// dictionaries.
     pub fn string(&self) -> Option<(&'b [u64], &'b [u8])> {
         let Some(ColumnLayout::String) = self.layout() else {
             return None;
@@ -330,12 +300,8 @@ impl<'b> Column<'b> {
             return None;
         }
         let offsets = unsafe { slice::from_raw_parts(offsets_ptr, n) };
-        // The data slab's length is a different field from the offsets, so
-        // trusting the final offset alone would build a slice past the
-        // allocation if the two ever disagreed. Take the capacity the column
-        // records and use the smaller: a mismatch truncates rather than
-        // reading out of bounds.
-        // SAFETY: layout is String, so the `str_` arm is the live one.
+        // Bound data by both final offset and recorded allocation size
+        // SAFETY: String layout selects `str_` union member
         let capacity = unsafe { (*self.raw).payload.str_.bytes };
         let claimed = offsets.last().copied().unwrap_or(0) as usize;
         debug_assert!(
@@ -414,8 +380,7 @@ impl<'b> Column<'b> {
         }
     }
 
-    /// LowCardinality keys: returns `(key_size_bytes, raw_key_bytes)` and
-    /// the dictionary column.
+    /// Returns keys and dictionary for a LowCardinality column.
     pub fn low_cardinality(&self) -> Option<LowCardinalityView<'b>> {
         let Some(ColumnLayout::LowCardinality) = self.layout() else {
             return None;
@@ -446,13 +411,13 @@ impl<'b> Column<'b> {
     }
 }
 
-/// A `LowCardinality` column split into its parts.
+/// Borrowed parts of a LowCardinality column.
 pub struct LowCardinalityView<'b> {
-    /// Width of one key in bytes: 1, 2, 4, or 8.
+    /// Key width in bytes. Valid values are 1, 2, 4, and 8.
     pub key_size: usize,
-    /// `n_rows * key_size` raw bytes, host byte order. Each key indexes
-    /// `dict`; [`Column::validate`] is what proves they are in range.
+    /// Raw keys in host byte order. Length is `n_rows * key_size`.
+    /// Call [`Column::validate`] before using untrusted keys as indexes.
     pub keys: &'b [u8],
-    /// The dictionary the keys index.
+    /// Dictionary referenced by keys.
     pub dict: Column<'b>,
 }

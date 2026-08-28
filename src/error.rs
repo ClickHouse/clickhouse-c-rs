@@ -1,36 +1,33 @@
-//! Error type wrapping clickhouse-c's `chc_err`.
+//! Error types returned by clickhouse-c-rs.
 
 use core::ffi::c_int;
 
 use crate::sys;
 
-/// Safe mirror of clickhouse-c's `CHC_ERR_*` codes.
+/// Category corresponding to a clickhouse-c `CHC_ERR_*` code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// Transport failure, or a read deadline elapsed.
+    /// Transport operation failed or read deadline expired.
     Io,
-    /// Stream ended where more bytes were required.
+    /// Stream ended before required data was available.
     Eof,
-    /// Wire bytes did not parse: bad framing, an unknown packet, a length
-    /// that does not fit its buffer.
+    /// Protocol data was invalid or unsupported.
     Protocol,
-    /// A type name did not parse, or a column did not match its type.
+    /// Type name was invalid or column did not match its declared type.
     Type,
-    /// The allocator returned null.
+    /// Allocator returned a null pointer.
     Oom,
-    /// A [`CancelToken`](crate::CancelToken) was set before this read.
+    /// [`CancelToken`](crate::CancelToken) was set before a read.
     Cancelled,
-    /// The server sent an exception; `server_code` and `server_name` carry
-    /// its identity.
+    /// Server returned an exception. See [`Error::server_code`] and
+    /// [`Error::server_name`] for details.
     Server,
-    /// The caller broke an API contract: mismatched row counts, a codec that
-    /// cannot do the selected compression, an interior NUL in a C string.
+    /// API input was invalid.
     Usage,
-    /// The ioless client needs more submitted bytes to make progress. Never
-    /// produced by the blocking client.
+    /// I/O-independent client requires more input. Blocking client does not
+    /// return this category.
     WouldBlock,
-    /// A code this crate does not map, meaning the vendored headers grew one
-    /// without a matching variant here.
+    /// Error code is not represented by another variant.
     Other(c_int),
 }
 
@@ -51,16 +48,16 @@ impl ErrorKind {
     }
 }
 
-/// Anything this crate can fail with.
+/// Error returned by this crate.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("clickhouse-c: {kind:?}: {message}")]
 pub struct Error {
     pub kind: ErrorKind,
-    /// ClickHouse error code when `kind` is [`ErrorKind::Server`], else 0.
+    /// ClickHouse error code, or zero when `kind` is not [`ErrorKind::Server`].
     pub server_code: i32,
-    /// Copied out of the C `chc_err` buffer, which does not outlive the call.
+    /// Error message copied from clickhouse-c.
     pub message: String,
-    /// Server-side exception name when `kind` is [`ErrorKind::Server`].
+    /// Server exception name, empty when `kind` is not [`ErrorKind::Server`].
     pub server_name: String,
 }
 
@@ -90,7 +87,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// `Result` with this crate's [`Error`].
+/// Result type used by this crate.
 pub type Result<T> = core::result::Result<T, Error>;
 
 fn cstr_array_to_string(buf: &[core::ffi::c_char]) -> String {
@@ -120,10 +117,7 @@ mod tests {
         e
     }
 
-    // The compressed-recv frame pump leaves a populated `err` message behind
-    // on an otherwise-CHC_OK return; rc is authoritative, so that must stay
-    // Ok. Regression guard for the bootstrap-drain "WouldBlock: ioless buffer
-    // drained" leak.
+    // Compressed receive can leave stale text in `err` after successful return
     #[test]
     fn ok_rc_ignores_stale_err() {
         let stale = err_with("ioless buffer drained");

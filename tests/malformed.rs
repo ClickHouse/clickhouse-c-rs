@@ -1,10 +1,8 @@
-//! Malformed wire input must produce errors, never a panic or worse.
+//! Malformed input tests for block and packet decoders.
 //!
-//! A real fuzzer belongs here eventually; this is the deterministic,
-//! always-on version of the same idea. It takes a valid Native block, mutates
-//! it every way a corrupt or hostile peer might, and asserts the decoder
-//! declines rather than misbehaving. Run under a sanitizer it also covers the
-//! C boundary:
+//! Tests apply deterministic mutations to a valid Native block and require
+//! decoder to return without panicking. Use following command for sanitizer
+//! coverage across C boundary:
 //!
 //! ```sh
 //! CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
@@ -13,11 +11,8 @@
 //! cargo +nightly test --target x86_64-unknown-linux-gnu --test malformed
 //! ```
 //!
-//! `allocator_may_return_null` matters: a corrupt row count can ask
-//! clickhouse-c for a hundreds-of-gigabytes null map, which is within the
-//! `CHC_MAX_NUM_ROWS` ceiling. `malloc` refuses and the library reports
-//! `ErrorKind::Oom`, but ASan aborts the process instead unless told to
-//! behave like `malloc`.
+//! `allocator_may_return_null=1` lets allocation failures return
+//! `ErrorKind::Oom` instead of aborting process.
 
 use core::ffi::{c_int, c_void};
 use core::marker::PhantomPinned;
@@ -28,7 +23,7 @@ use clickhouse_c::{
     Step, TypeAst, sys,
 };
 
-/// Read-only backend over a fixed byte slice: reads walk it, then report EOF.
+/// Read-only transport over fixed bytes.
 struct Bytes {
     io: sys::chc_io,
     data: Vec<u8>,
@@ -49,7 +44,7 @@ impl Bytes {
             at: 0,
             _pin: PhantomPinned,
         });
-        // SAFETY: sets a field at the pinned address; never moves out.
+        // SAFETY: set context after address becomes stable
         unsafe {
             let this = boxed.as_mut().get_unchecked_mut();
             this.io.ud = (this as *mut Self).cast();
@@ -58,11 +53,10 @@ impl Bytes {
     }
 }
 
-// SAFETY: `io` is fully wired, `ud` back-points at the same pinned node, and
-// `read` honours the vtable contract.
+// SAFETY: callback table and context remain valid within pinned Bytes
 unsafe impl Io for Bytes {
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
-        // SAFETY: field pointer; does not move self.
+        // SAFETY: returning field address does not move pinned value
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
 }
@@ -84,8 +78,7 @@ unsafe extern "C" fn read(
     sys::CHC_OK
 }
 
-/// A valid block: two columns, a composite and a dictionary, so a mutated
-/// byte can land in a type name, an offset array, a key, or a data slab.
+/// Creates valid block with nested and dictionary columns.
 fn valid_block() -> Vec<u8> {
     let alloc = Allocator::stdlib();
     let array_ty = TypeAst::parse("Array(Nullable(UInt32))", alloc).expect("array type");
@@ -121,7 +114,7 @@ fn valid_block() -> Vec<u8> {
     sink.as_ref().get_ref().data.clone()
 }
 
-/// Write-only backend, used once to capture the valid encoding.
+/// Write-only transport used to capture valid encoding.
 struct Sink {
     io: sys::chc_io,
     data: Vec<u8>,
@@ -140,7 +133,7 @@ impl Sink {
             data: Vec::new(),
             _pin: PhantomPinned,
         });
-        // SAFETY: sets a field at the pinned address; never moves out.
+        // SAFETY: set context after address becomes stable
         unsafe {
             let this = boxed.as_mut().get_unchecked_mut();
             this.io.ud = (this as *mut Self).cast();
@@ -149,10 +142,10 @@ impl Sink {
     }
 }
 
-// SAFETY: as for `Bytes`, with `write` in place of `read`.
+// SAFETY: callback table and context remain valid within pinned Sink
 unsafe impl Io for Sink {
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
-        // SAFETY: field pointer; does not move self.
+        // SAFETY: returning field address does not move pinned value
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
 }
@@ -169,8 +162,7 @@ unsafe extern "C" fn write(
     sys::CHC_OK
 }
 
-/// Decode `bytes`, then walk whatever came back. Returning at all is the
-/// assertion; a panic or a sanitizer report is the failure.
+/// Decodes and traverses result without requiring successful decoding.
 fn decode_and_walk(bytes: Vec<u8>) {
     let alloc = Allocator::stdlib();
     let mut io = Bytes::new(bytes);
@@ -178,8 +170,7 @@ fn decode_and_walk(bytes: Vec<u8>) {
         return;
     };
     while let Ok(Some(block)) = reader.read() {
-        // Traverse the way a consumer would, including the accessors that
-        // build slices from column-side lengths.
+        // Exercise accessors that construct slices from decoded lengths
         if block.validate().is_err() {
             continue;
         }
@@ -221,7 +212,7 @@ fn walk(col: clickhouse_c::Column<'_>) {
     }
 }
 
-/// Deterministic so a failure is reproducible from the seed alone.
+/// Deterministic generator initialized from reproducible seed.
 struct Rng(u64);
 
 impl Rng {
@@ -245,8 +236,7 @@ fn every_truncation_is_rejected_cleanly() {
 #[test]
 fn every_single_byte_corruption_is_survivable() {
     let valid = valid_block();
-    // 0xFF turns a varint continuation on and blows up a length field, which
-    // is the interesting direction; 0x00 and a bit flip cover the rest.
+    // Include varint continuation, zeroing, and bit-flip mutations
     for at in 0..valid.len() {
         for patch in [0x00u8, 0xFF, valid[at] ^ 0x01, valid[at] ^ 0x80] {
             let mut bytes = valid.clone();
@@ -285,15 +275,14 @@ fn pure_garbage_is_rejected_cleanly() {
     }
 }
 
-/// The same sweep through the packet parser, which frames blocks differently
-/// and is what a network peer actually reaches.
+/// Applies mutation set through native protocol packet parser.
 #[test]
 fn the_packet_parser_survives_garbage() {
     let mut rng = Rng(0xfeed_face_dead_beef);
     for _ in 0..500 {
         let mut core =
             IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None).expect("construct");
-        // Past the Hello the machine is in the state a real connection reaches.
+        // Complete Hello before submitting packet mutations
         assert!(matches!(
             core.handshake().expect("hello queued"),
             Step::NeedsInput
@@ -303,8 +292,7 @@ fn the_packet_parser_survives_garbage() {
         if core.submit(&bytes).is_err() {
             continue;
         }
-        // Either a decoded event, an error, or "need more" -- any is fine, a
-        // panic is not.
+        // Any protocol result is acceptable if parser does not panic
         let _ = core.handshake();
         let _ = core.recv_event();
     }

@@ -1,16 +1,8 @@
-//! Upstream-drift guard.
+//! Checks raw bindings against bundled C headers.
 //!
-//! `src/sys.rs` is hand-written, so a vendored-header bump that adds a
-//! function or an enumerator would otherwise land silently: the new function
-//! is simply unreachable, and the new enumerator makes `Kind::from_raw` and
-//! friends start returning `None` for a value the server legitimately sends.
-//!
-//! `build.rs` scans the covered headers and `src/sys.rs` into
-//! `$OUT_DIR/parity.rs`; these tests compare the two. Accepting a new upstream
-//! symbol means editing the lists below, which is the point — the decision is
-//! recorded rather than defaulted.
-//!
-//! Struct geometry is guarded separately, by `tests/layout.rs`.
+//! `build.rs` generates function and enum inventories in `$OUT_DIR/parity.rs`.
+//! Tests compare generated inventories with hand-written `src/sys.rs`.
+//! `tests/layout.rs` checks structure layouts separately.
 
 use crate::block::ColumnLayout;
 use crate::client::PacketKind;
@@ -22,16 +14,14 @@ mod generated {
 
 use generated::{HEADER_ENUMERATORS, HEADER_FUNCTIONS, SYS_FUNCTIONS};
 
-/// Header functions `sys` deliberately leaves undeclared, with the reason.
+/// Header functions intentionally omitted from `sys`.
 const UNDECLARED: &[(&str, &str)] = &[(
     "chc_err_reset",
     "static inline in clickhouse.h, so there is no external symbol to link; \
      Rust passes a fresh chc_err::zeroed() per call instead",
 )];
 
-/// `sys` functions with no header declaration: the crate's own C shims in
-/// `src/wrapper.c`, which exist because Rust cannot allocate clickhouse-c's
-/// incomplete struct types by value.
+/// Local C helpers declared in `sys` but not in upstream headers.
 const CRATE_SHIMS: &[&str] = &[
     "chc_rs_in_destroy",
     "chc_rs_in_new",
@@ -39,7 +29,7 @@ const CRATE_SHIMS: &[&str] = &[
     "chc_rs_monotonic_us",
 ];
 
-/// Enumerators that are not wire values, so no safe variant maps to them.
+/// Enum sentinels that do not represent wire values.
 fn is_sentinel(name: &str) -> bool {
     name.ends_with("_COUNT") || name.ends_with("_LAST")
 }
@@ -109,8 +99,7 @@ fn every_column_layout_maps_to_a_variant() {
     }
 }
 
-/// Packet kinds that never arrive from the server, so `PacketKind` has no
-/// variant for them.
+/// Packet kinds handled internally rather than returned as `PacketKind`.
 const CLIENT_ONLY_PACKETS: &[&str] = &["CHC_PKT_HELLO"];
 
 #[test]
@@ -127,9 +116,7 @@ fn every_server_packet_kind_maps_to_a_variant() {
     }
 }
 
-/// The safe enums are `#[repr]`-tagged with the generated constants, so a
-/// variant can only exist for a value upstream still publishes. This catches
-/// the other direction: a variant kept alive by a stale hand-written constant.
+/// Verifies every safe enum value remains present in upstream headers.
 #[test]
 fn header_enumerators_cover_the_generated_constants() {
     assert!(

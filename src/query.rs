@@ -1,9 +1,8 @@
-//! Per-query settings, parameters, and identity.
+//! Query identifiers, settings, and parameters.
 //!
-//! [`QueryOpts`] is the safe form of `chc_query_opts`. Names and values are
-//! `&str` and get NUL-terminated copies made at send time; an interior NUL
-//! is rejected as [`ErrorKind::Usage`] rather than silently truncating the
-//! string the server sees.
+//! [`QueryOpts`] represents `chc_query_opts` with borrowed Rust strings.
+//! Sending a query creates null-terminated copies. Strings containing null
+//! bytes return [`ErrorKind::Usage`].
 
 use core::ffi::c_char;
 use std::ffi::CString;
@@ -11,20 +10,19 @@ use std::ffi::CString;
 use crate::error::{Error, ErrorKind, Result};
 use crate::sys;
 
-/// One entry in the query's `SETTINGS` list.
+/// Query setting sent to ClickHouse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuerySetting<'a> {
     pub name: &'a str,
     pub value: &'a str,
-    /// Ask the server to reject the query instead of ignoring a setting it
-    /// does not recognize.
+    /// Requests an error when server does not recognize setting.
     pub important: bool,
-    /// A user-defined `custom_*` setting rather than a built-in one.
+    /// Identifies setting as a user-defined `custom_*` setting.
     pub custom: bool,
 }
 
 impl<'a> QuerySetting<'a> {
-    /// A plain setting: not important, not custom.
+    /// Creates a built-in setting that server may ignore when unknown.
     pub const fn new(name: &'a str, value: &'a str) -> Self {
         Self {
             name,
@@ -34,13 +32,13 @@ impl<'a> QuerySetting<'a> {
         }
     }
 
-    /// Set [`important`](Self::important).
+    /// Marks setting as important.
     pub const fn important(mut self) -> Self {
         self.important = true;
         self
     }
 
-    /// Set [`custom`](Self::custom).
+    /// Marks setting as user-defined.
     pub const fn custom(mut self) -> Self {
         self.custom = true;
         self
@@ -50,24 +48,20 @@ impl<'a> QuerySetting<'a> {
 impl QuerySetting<'static> {
     /// `output_format_native_encode_types_in_binary_format = 0`.
     ///
-    /// The block decoder reads printable type names off the wire. ClickHouse
-    /// writes them as text by default, but pin the setting on every query so
-    /// a server or session profile that flips it to binary cannot break
-    /// decoding.
+    /// Block decoder requires text type names. Include this setting when a
+    /// server or profile may enable binary type names.
     pub const TEXT_TYPE_NAMES: Self =
         Self::new("output_format_native_encode_types_in_binary_format", "0");
 }
 
-/// One `{name:Type}` placeholder substitution.
+/// Value for a `{name:Type}` query parameter.
 ///
-/// `value` must be a **single-quoted** literal whatever the placeholder's
-/// declared type: the server reads the parameter with `readQuoted` and then
-/// parses the unquoted text as `Type`. So `{n:UInt8}` takes `'42'`, not `42`,
-/// and a bare `42` is a server-side parse error. Escape an embedded quote or
-/// backslash the usual way, and write NULL as `'\\N'`.
+/// `value` must be a single-quoted literal for every declared type. For
+/// example, `{n:UInt8}` requires `'42'`. Escape quotes and backslashes using
+/// ClickHouse syntax. Represent null as `'\\N'`.
 ///
-/// clickhouse-c's header comment describes the older `Field::restoreFromDump`
-/// behaviour and is out of date on this point.
+/// Current server behavior differs from older behavior described in
+/// clickhouse-c header comments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueryParam<'a> {
     pub name: &'a str,
@@ -75,24 +69,25 @@ pub struct QueryParam<'a> {
 }
 
 impl<'a> QueryParam<'a> {
-    /// `value` must be single-quoted; see the type docs.
+    /// Creates a parameter. `value` must be single-quoted as described in
+    /// [`QueryParam`] documentation.
     pub const fn new(name: &'a str, value: &'a str) -> Self {
         Self { name, value }
     }
 }
 
-/// Everything [`Client::send_query_with`](crate::Client::send_query_with)
-/// attaches to a query beyond the SQL text.
+/// Additional values sent by
+/// [`Client::send_query_with`](crate::Client::send_query_with).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QueryOpts<'a> {
-    /// Server-side query id. Empty means the server assigns one.
+    /// Query identifier. `None` lets server assign an identifier.
     pub query_id: Option<&'a str>,
     pub settings: &'a [QuerySetting<'a>],
     pub params: &'a [QueryParam<'a>],
 }
 
 impl<'a> QueryOpts<'a> {
-    /// No query id, no settings, no parameters.
+    /// Creates options without query identifier, settings, or parameters.
     pub const fn new() -> Self {
         Self {
             query_id: None,
@@ -101,31 +96,28 @@ impl<'a> QueryOpts<'a> {
         }
     }
 
-    /// Set the server-side query id.
+    /// Sets query identifier.
     pub const fn query_id(mut self, id: &'a str) -> Self {
         self.query_id = Some(id);
         self
     }
 
-    /// Replace the settings list.
+    /// Sets query settings.
     pub const fn settings(mut self, settings: &'a [QuerySetting<'a>]) -> Self {
         self.settings = settings;
         self
     }
 
-    /// Replace the parameter list.
+    /// Sets query parameters.
     pub const fn params(mut self, params: &'a [QueryParam<'a>]) -> Self {
         self.params = params;
         self
     }
 }
 
-/// NUL-terminated copies of a [`QueryOpts`]'s strings plus the C arrays
-/// pointing at them, kept together so the pointers stay valid for exactly as
-/// long as the `chc_query_opts` that borrows them.
+/// Owns null-terminated query strings and C arrays that reference them.
 pub(crate) struct RawQueryOpts {
-    // Each CString owns its own heap buffer, so the pointers handed to C stay
-    // valid however this struct moves.
+    // CString buffers remain stable when this structure moves
     _owned: Vec<CString>,
     settings: Vec<sys::chc_query_setting>,
     params: Vec<sys::chc_query_param>,
@@ -165,8 +157,7 @@ impl RawQueryOpts {
             .collect();
 
         let (query_id, query_id_len) = match opts.query_id {
-            // chc_query_opts takes query_id as pointer + length, so no NUL
-            // terminator is needed and any byte is legal.
+            // Query identifier uses pointer and length, not null termination
             Some(id) => (id.as_ptr().cast::<c_char>(), id.len()),
             None => (core::ptr::null(), 0),
         };
@@ -183,9 +174,7 @@ impl RawQueryOpts {
                 n_params: 0,
             },
         };
-        // Vec buffers live on the heap, so their addresses survive the move
-        // out of this function; only `raw` itself must not move afterwards,
-        // which the &self borrow in as_ptr enforces.
+        // Vec buffers retain their addresses when this structure moves
         this.raw.settings = this.settings.as_ptr();
         this.raw.n_settings = this.settings.len();
         this.raw.params = this.params.as_ptr();
@@ -199,8 +188,7 @@ impl RawQueryOpts {
     }
 }
 
-/// NUL-terminate `s`, rejecting an interior NUL. C would stop at the first
-/// one, so the server would silently see a different string.
+/// Converts `s` to a null-terminated string and rejects interior null bytes.
 pub(crate) fn cstring(label: &str, s: &str) -> Result<CString> {
     CString::new(s).map_err(|e| {
         Error::new(

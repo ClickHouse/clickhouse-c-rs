@@ -1,7 +1,4 @@
-//! Tokio adapter over the runtime-neutral [`IolessClient`].
-//!
-//! This is a byte pump and nothing more: the protocol lives in
-//! [`IolessClient`], which is why another runtime needs no code from here.
+//! Tokio client built on [`IolessClient`].
 
 use core::pin::Pin;
 
@@ -17,33 +14,25 @@ use crate::ioless::{IolessClient, Step};
 
 const DEFAULT_READ_BUF_BYTES: usize = 8 * 1024;
 
-/// Transport [`AsyncClient`] drives: a stream it owns and pumps bytes
-/// through. Blanket-implemented, so any `AsyncRead + AsyncWrite + Unpin +
-/// Send` qualifies and nothing has to implement it by hand. The `Send`
-/// bound keeps the client's method futures `Send`, which `tokio::spawn` on
-/// a multi-thread runtime requires.
+/// Asynchronous byte stream used by [`AsyncClient`].
+///
+/// Any `AsyncRead + AsyncWrite + Unpin + Send` type implements this trait.
 pub trait AsyncTransport: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncTransport for S {}
 
-/// [`AsyncClient`] with its transport type erased, so a plaintext and a TLS
-/// connection are one type: storable in a struct field, a `Vec`, or
-/// reassignable on reconnect without a hand-written enum delegating every
-/// method.
+/// [`AsyncClient`] with transport type erased.
 ///
-/// Dispatch is dynamic per socket read and write only. The protocol work
-/// and the method futures are untouched: no boxed futures, no allocation
-/// per call.
+/// Use this alias when plaintext and TLS connections must share one type.
+/// Dynamic dispatch applies to transport reads and writes.
 pub type BoxedAsyncClient = AsyncClient<Box<dyn AsyncTransport>>;
 
-/// Worker-free async ClickHouse client.
+/// Asynchronous ClickHouse native protocol client.
 ///
-/// Generic over the transport, so a caller can bring their own
-/// [`AsyncTransport`]: a TLS stream from another library, a proxied socket,
-/// a duplex pipe in a test. [`connect`](Self::connect) and
-/// [`connect_tls`](Self::connect_tls) are conveniences over the two common
-/// ones. [`boxed`](Self::boxed) erases the transport type when plaintext and
-/// TLS connections have to share one type.
+/// Client accepts any [`AsyncTransport`]. [`connect`](Self::connect) creates a
+/// TCP connection. [`connect_tls`](Self::connect_tls) creates a rustls
+/// connection when `tls` feature is enabled. [`boxed`](Self::boxed) erases
+/// transport type.
 pub struct AsyncClient<S = TcpStream> {
     core: IolessClient,
     stream: S,
@@ -51,9 +40,9 @@ pub struct AsyncClient<S = TcpStream> {
 }
 
 impl AsyncClient<TcpStream> {
-    /// TCP-connect and run the Hello handshake. Sets `TCP_NODELAY`: Native is
-    /// request/response, so Nagle only adds latency to the small writes
-    /// between blocks.
+    /// Connects over TCP and completes Hello handshake.
+    ///
+    /// Socket uses `TCP_NODELAY`.
     pub async fn connect<A>(
         addr: A,
         opts: ClientOpts,
@@ -70,9 +59,10 @@ impl AsyncClient<TcpStream> {
 
 #[cfg(feature = "tls")]
 impl AsyncClient<tokio_rustls::client::TlsStream<TcpStream>> {
-    /// Connect over TLS: TCP-connect to `addr`, then rustls-handshake
-    /// verifying the peer against `config` for `domain` (sent as SNI).
-    /// `config` typically comes from
+    /// Connects over TCP and TLS, then completes Hello handshake.
+    ///
+    /// TLS verifies peer using `config` and `domain`. Domain is also sent as
+    /// SNI. Default configuration is available from
     /// [`tls::default_config`](crate::tls::default_config).
     pub async fn connect_tls<A>(
         addr: A,
@@ -102,7 +92,7 @@ impl AsyncClient<tokio_rustls::client::TlsStream<TcpStream>> {
 }
 
 impl<S: AsyncTransport> AsyncClient<S> {
-    /// Run the Hello handshake over an already-connected transport.
+    /// Completes Hello handshake over an existing transport.
     pub async fn handshake_on(
         stream: S,
         opts: ClientOpts,
@@ -128,22 +118,23 @@ impl<S: AsyncTransport> AsyncClient<S> {
         self.drain_out().await
     }
 
-    /// Send a Data block, or the empty terminator with [`None`].
+    /// Sends a Data block, or empty terminator when `builder` is `None`.
     pub async fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
         self.drain_out().await?;
         self.core.send_data(builder)?;
         self.drain_out().await
     }
 
-    /// Close an INSERT's data stream.
+    /// Sends empty Data block that ends INSERT input.
     pub async fn send_data_end(&mut self) -> Result<()> {
         self.drain_out().await?;
         self.core.send_data_end()?;
         self.drain_out().await
     }
 
-    /// Await the next server event, pumping the socket as needed. Any block
-    /// or exception payload is owned by the returned [`Event`].
+    /// Waits for next server event.
+    ///
+    /// Returned event owns block or exception payload.
     pub async fn recv_event(&mut self) -> Result<Event> {
         let mut event = None;
         self.pump_until_ready(|core| {
@@ -159,13 +150,12 @@ impl<S: AsyncTransport> AsyncClient<S> {
         Ok(event.expect("pump_until_ready only returns once the step stored an event"))
     }
 
-    /// Identity the server sent during the handshake.
+    /// Returns server identity received during handshake.
     pub fn server_info(&self) -> Option<ServerInfo> {
         self.core.server_info()
     }
 
-    /// Box the transport behind a trait object; see [`BoxedAsyncClient`].
-    /// The connection is untouched, so this is callable mid-stream.
+    /// Erases transport type without changing connection state.
     pub fn boxed(self) -> BoxedAsyncClient
     where
         S: 'static,
@@ -177,8 +167,7 @@ impl<S: AsyncTransport> AsyncClient<S> {
         }
     }
 
-    /// The protocol machine underneath, for anything the adapter does not
-    /// expose.
+    /// Returns mutable access to transport-independent protocol client.
     pub fn core(&mut self) -> &mut IolessClient {
         &mut self.core
     }
@@ -186,9 +175,7 @@ impl<S: AsyncTransport> AsyncClient<S> {
     async fn drain_out(&mut self) -> Result<()> {
         let mut wrote = false;
         loop {
-            // Disjoint field borrows: the &[u8] into the machine's queue is
-            // alive across the write, but only `self.stream` is borrowed
-            // mutably, and a shared slice is Send so the future stays Send.
+            // Queue and stream are disjoint fields across await
             let buf = self.core.pending_out();
             if buf.is_empty() {
                 break;
@@ -200,11 +187,7 @@ impl<S: AsyncTransport> AsyncClient<S> {
             self.core.consume_out(n);
             wrote = true;
         }
-        // A TLS stream's poll_write may leave the tail of a record buffered in
-        // rustls when the socket briefly back-pressures; flush forces it out
-        // so the server is not left waiting on a half-sent Hello or query.
-        // Skipped when nothing was written, so the recv path never flushes an
-        // idle stream.
+        // TLS can buffer partial record after poll_write reports progress
         if wrote {
             self.stream.flush().await?;
         }
@@ -238,7 +221,9 @@ impl<S: AsyncTransport> AsyncClient<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncClient, BoxedAsyncClient, Event};
+    use super::{AsyncClient, Event};
+    #[cfg(feature = "tls")]
+    use super::{BoxedAsyncClient, TcpStream};
     use crate::builder::BlockBuilder;
     use crate::client::ClientOpts;
 
@@ -249,11 +234,7 @@ mod tests {
         assert_send::<Event>();
     }
 
-    // Compile-time guard: the method futures must be `Send`, not just
-    // `AsyncClient` itself, or `tokio::spawn` on a multi-thread runtime
-    // rejects them. A raw FFI pointer held across an await silently makes a
-    // future `!Send` -- invisible to the live `current_thread` tests, so
-    // assert it here where it costs nothing.
+    // Multi-thread Tokio requires method futures to implement Send
     #[allow(dead_code)]
     fn method_futures_are_send(mut c: AsyncClient, bb: BlockBuilder<'static>) {
         fn require_send<T: Send>(_: T) {}
@@ -272,33 +253,20 @@ mod tests {
         require_send(c.recv_event());
     }
 
-    // Erasure is the point of `boxed`: two transport types, one client
-    // type, so a consumer holding either needs no delegating wrapper. The
-    // erased futures must stay `Send` too.
-    #[allow(dead_code)]
-    fn boxed_clients_unify(
-        plain: AsyncClient,
-        tls_like: AsyncClient<tokio::io::DuplexStream>,
-    ) -> Vec<BoxedAsyncClient> {
-        fn require_send<T: Send>(_: T) {}
-        let mut erased = plain.boxed();
-        require_send(erased.recv_event());
-        vec![erased, tls_like.boxed()]
-    }
-
-    // The consumer case for erasure: a config flag picks plaintext or TLS,
-    // and one field holds whichever came back.
+    // Plaintext and TLS clients must share erased type and Send futures
     #[cfg(feature = "tls")]
     #[allow(dead_code)]
     fn plaintext_and_tls_share_one_type(
         plain: AsyncClient,
-        tls: AsyncClient<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        tls: AsyncClient<tokio_rustls::client::TlsStream<TcpStream>>,
     ) -> Vec<BoxedAsyncClient> {
-        vec![plain.boxed(), tls.boxed()]
+        fn require_send<T: Send>(_: T) {}
+        let mut erased = plain.boxed();
+        require_send(erased.recv_event());
+        vec![erased, tls.boxed()]
     }
 
-    // The adapter is generic, so a caller can drive the protocol over any
-    // tokio transport, not just the two the constructors cover.
+    // Custom Tokio transports use same protocol adapter
     #[allow(dead_code)]
     fn any_tokio_transport_works(pipe: tokio::io::DuplexStream) {
         fn require_send<T: Send>(_: T) {}

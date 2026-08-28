@@ -1,4 +1,4 @@
-//! Per-query settings and parameters against a spawned `clickhouse server`.
+//! Query option tests using a temporary ClickHouse server.
 
 mod common;
 
@@ -22,8 +22,7 @@ fn connect(server: &ChServer) -> TestResult<Client<'static>> {
     )?)
 }
 
-/// Drain to EndOfStream, concatenating column 0 of every Data block as
-/// strings. Every query below selects a single `String` column.
+/// Reads first string column from all Data blocks through EndOfStream.
 fn collect_strings(client: &mut Client<'_>) -> TestResult<Vec<String>> {
     let mut rows = vec![];
     loop {
@@ -84,7 +83,7 @@ fn custom_settings_reach_the_server() -> TestResult {
         eprintln!("skipping: clickhouse not on PATH");
         return Ok(());
     }
-    // Custom settings only exist once the server declares a prefix for them.
+    // Server requires declared prefix for custom settings
     let server = ChServer::spawn_with(&["--custom_settings_prefixes=custom_"])?;
 
     let settings = [
@@ -100,8 +99,7 @@ fn custom_settings_reach_the_server() -> TestResult {
     Ok(())
 }
 
-/// An unknown setting is ignored by default. `important` turns it into a
-/// server exception, which is the whole point of the flag.
+/// Verifies important unknown setting returns server exception.
 #[test]
 fn important_flag_makes_an_unknown_setting_fatal() -> TestResult {
     if !clickhouse_on_path() {
@@ -185,7 +183,7 @@ fn empty_opts_behave_like_a_bare_query() -> TestResult {
     Ok(())
 }
 
-/// No server needed: the interior NUL is rejected before anything is sent.
+/// Verifies interior null byte is rejected before I/O.
 #[test]
 fn interior_nul_in_client_opts_is_a_usage_error() {
     let opts = ClientOpts::new().user("def\u{0}ault");

@@ -1,9 +1,6 @@
-//! Compile check for the snippets in `docs/index.mdx`.
+//! Compile checks for external documentation examples.
 //!
-//! Those docs are published separately, so nothing else here would catch them
-//! drifting from the API. Each function below is the snippet with its
-//! surrounding `fn` and imports filled in; most are never called, because
-//! compiling is the assertion.
+//! Most functions are not called because compilation verifies API usage.
 
 #![allow(dead_code)]
 
@@ -21,7 +18,7 @@ type DocResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn print_block(_block: &Block) {}
 
-// ---- Connecting over TCP -------------------------------------------------
+// TCP connection
 
 fn connecting_over_tcp() -> DocResult {
     let sock = TcpStream::connect("localhost:9000")?;
@@ -37,7 +34,7 @@ fn connecting_over_tcp() -> DocResult {
         &opts,
         Allocator::stdlib(),
         PosixIo::new_owned(sock),
-        None, // no codec: uncompressed
+        None, // Uncompressed connection does not require codec
     )?;
 
     let info = client.server_info().expect("handshake completed");
@@ -49,14 +46,13 @@ fn connecting_over_tcp() -> DocResult {
     Ok(())
 }
 
-// ---- Running a query -----------------------------------------------------
+// Query execution
 
 fn running_a_query(client: &mut Client<'_>) -> DocResult {
     let settings = [
         QuerySetting::TEXT_TYPE_NAMES,
         QuerySetting::new("max_block_size", "8192"),
-        // `important` makes the server reject a setting it does not recognize
-        // instead of ignoring it.
+        // Request error for unknown setting
         QuerySetting::new("max_execution_time", "30").important(),
     ];
     let params = [QueryParam::new("cutoff", "'100'")];
@@ -72,13 +68,13 @@ fn running_a_query(client: &mut Client<'_>) -> DocResult {
             Event::Data(block) => print_block(&block),
             Event::Exception(exc) => return Err(exc.into()),
             Event::EndOfStream => break,
-            _ => {} // Progress, ProfileInfo, Log, ...
+            _ => {} // Ignore other protocol events
         }
     }
     Ok(())
 }
 
-// ---- Reading column data -------------------------------------------------
+// Column reading
 
 fn print_value(ty: TypeRef<'_>, col: Column<'_>, row: usize) {
     if let Some(ColumnLayout::Nullable) = col.layout() {
@@ -95,8 +91,7 @@ fn print_value(ty: TypeRef<'_>, col: Column<'_>, row: usize) {
 
     match col.layout() {
         Some(ColumnLayout::Fixed) => {
-            // A raw little-endian slab: slice the row out and convert, rather
-            // than casting the pointer, so alignment is never an issue.
+            // Decode little-endian bytes without assuming alignment
             let Some((elem_size, bytes)) = col.fixed() else {
                 return;
             };
@@ -132,7 +127,7 @@ fn print_value(ty: TypeRef<'_>, col: Column<'_>, row: usize) {
     }
 }
 
-// ---- Inserting data ------------------------------------------------------
+// Data insertion
 
 fn inserting_data(client: &mut Client<'_>) -> DocResult {
     client.send_query_with(
@@ -140,7 +135,7 @@ fn inserting_data(client: &mut Client<'_>) -> DocResult {
         &QueryOpts::new(),
     )?;
 
-    // Wait for the header block: schema, zero rows.
+    // Wait for zero-row INSERT structure block
     loop {
         match client.recv_event()? {
             Event::Data(_) => break,
@@ -157,7 +152,7 @@ fn inserting_data(client: &mut Client<'_>) -> DocResult {
     let ids: Vec<u8> = [1u64, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
     let id = ColumnBuilder::fixed(&ids, 8, 3)?;
 
-    // String columns: cumulative exclusive end offsets over a packed slab.
+    // String offsets contain cumulative exclusive ends
     let offsets = [5u64, 11, 20];
     let bytes = b"hellobuenasgoedendag";
     let message = ColumnBuilder::string(&offsets, bytes, 3)?;
@@ -166,8 +161,8 @@ fn inserting_data(client: &mut Client<'_>) -> DocResult {
     block.append("id", u64_ty.view(), &id)?;
     block.append("message", str_ty.view(), &message)?;
 
-    client.send_data(Some(&block))?; // the populated block
-    client.send_data(None)?; // empty block ends the INSERT
+    client.send_data(Some(&block))?; // Send rows
+    client.send_data(None)?; // End INSERT input
 
     loop {
         match client.recv_event()? {
@@ -186,14 +181,14 @@ fn nesting_composites(
     array_ty: &TypeAst,
 ) -> DocResult {
     let leaf = ColumnBuilder::fixed(values, 4, 4)?;
-    let nullable = leaf.nullable(null_map)?; // borrows leaf
-    let array = nullable.array(array_offsets, 3)?; // borrows nullable
+    let nullable = leaf.nullable(null_map)?; // Retains borrow of leaf
+    let array = nullable.array(array_offsets, 3)?; // Retains borrow of nullable
     let mut block = BlockBuilder::new();
-    block.append("v", array_ty.view(), &array)?; // borrows array until the write
+    block.append("v", array_ty.view(), &array)?; // Retains borrow until write
     Ok(())
 }
 
-// ---- Reading Native without a server -------------------------------------
+// Native block reading without server
 
 fn native_without_a_server() -> DocResult {
     let mut child = Command::new("clickhouse")
@@ -210,8 +205,7 @@ fn native_without_a_server() -> DocResult {
     let stdout = child.stdout.take().expect("piped");
     let mut io = PosixIo::new(stdout.as_fd());
 
-    // One reader across every read: bytes pulled past a block boundary stay
-    // buffered, so a multi-block result decodes without dropping the tail.
+    // Reuse reader to preserve buffered bytes between blocks
     let mut reader = BlockReader::new(io.as_mut(), Allocator::stdlib(), BlockOpts::default())?;
     while let Some(block) = reader.read()? {
         print_block(&block);
@@ -219,7 +213,7 @@ fn native_without_a_server() -> DocResult {
     Ok(())
 }
 
-// ---- Compression ---------------------------------------------------------
+// Compression
 
 fn compression(io: core::pin::Pin<Box<PosixIo<'static>>>) -> DocResult {
     let opts = ClientOpts::new()
@@ -230,7 +224,7 @@ fn compression(io: core::pin::Pin<Box<PosixIo<'static>>>) -> DocResult {
     Ok(())
 }
 
-// ---- TLS -----------------------------------------------------------------
+// TLS
 
 fn tls_client() -> DocResult {
     use clickhouse_c::tls;
@@ -238,7 +232,7 @@ fn tls_client() -> DocResult {
     let tcp = TcpStream::connect(("myhost.clickhouse.cloud", 9440))?;
     tcp.set_nodelay(true).ok();
 
-    // Verifies the chain and the SNI hostname against the Mozilla webpki roots.
+    // Verify certificate chain and SNI hostname against Mozilla roots
     let io = tls::TlsIo::connect(tcp, "myhost.clickhouse.cloud", tls::default_config())?;
     let mut client = Client::init(
         &ClientOpts::new().user("default").password("…"),
@@ -250,7 +244,7 @@ fn tls_client() -> DocResult {
     Ok(())
 }
 
-// ---- Async client --------------------------------------------------------
+// Asynchronous client
 
 async fn async_client() -> DocResult {
     use clickhouse_c::AsyncClient;
@@ -295,7 +289,7 @@ async fn async_client_boxed_transport(secure: bool) -> DocResult {
     Ok(())
 }
 
-// ---- Any other runtime ---------------------------------------------------
+// Alternate runtime
 
 fn ioless_over_a_blocking_socket() -> DocResult {
     use clickhouse_c::{IolessClient, Step};
@@ -305,9 +299,7 @@ fn ioless_over_a_blocking_socket() -> DocResult {
     let mut core = IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None)?;
     let mut buf = [0u8; 8192];
 
-    // Push everything queued, then read once. Flushing before the read is not
-    // optional: a step that reports NeedsInput has usually just queued the
-    // bytes the server is waiting on, and reading first deadlocks both sides.
+    // Send all queued output before waiting for input
     let mut pump = |core: &mut IolessClient, sock: &mut TcpStream| -> clickhouse_c::Result<()> {
         while !core.pending_out().is_empty() {
             let n = sock.write(core.pending_out())?;
@@ -333,17 +325,17 @@ fn ioless_over_a_blocking_socket() -> DocResult {
     Ok(())
 }
 
-// ---- Cancellation --------------------------------------------------------
+// Cancellation
 
 fn cancellation(sock: TcpStream) {
     let cancel = CancelToken::new();
     let io = PosixIo::new_owned_cancellable(sock, cancel.clone());
-    // ... from another task or thread:
+    // Cancel from another task or thread
     cancel.cancel();
     drop(io);
 }
 
-// ---- Allocator -----------------------------------------------------------
+// Allocator
 
 static ARENA: std::alloc::System = std::alloc::System;
 
@@ -351,8 +343,7 @@ fn custom_allocator() -> Allocator {
     Allocator::global(&ARENA)
 }
 
-/// The one snippet cheap enough to run: it needs no server, and it exercises
-/// the reader path the docs' column table describes.
+/// Runs in-memory block example without a server.
 #[test]
 fn column_table_accessors_match_the_docs() {
     let alloc = Allocator::stdlib();
@@ -363,8 +354,7 @@ fn column_table_accessors_match_the_docs() {
     let mut block = BlockBuilder::new();
     block.append("message", ty.view(), &col).expect("append");
 
-    // Round-trip so `print_value` runs against a decoded column, not a
-    // builder node.
+    // Exercise decoded column rather than builder node
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let writer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
     let (reader, _) = listener.accept().expect("accept");

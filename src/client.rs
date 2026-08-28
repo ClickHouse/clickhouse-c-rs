@@ -1,7 +1,8 @@
-//! TCP client. Wraps `chc_client_*` from `clickhouse-client.h`.
+//! Blocking ClickHouse native protocol client.
 //!
-//! The caller owns the socket (or any other transport) and supplies it
-//! via [`PosixIo`]; this crate does not do TCP, DNS, or TLS itself.
+//! Caller supplies a connected [`Io`] transport. Crate provides
+//! [`PosixIo`](crate::PosixIo) for Unix file descriptors and
+//! `tls::TlsIo` for rustls connections.
 
 use core::ffi::c_char;
 use core::pin::Pin;
@@ -19,63 +20,61 @@ use crate::io::Io;
 use crate::query::{QueryOpts, RawQueryOpts, cstring};
 use crate::sys;
 
-/// Connection settings, sent in the Hello handshake.
+/// Client settings sent during Hello handshake.
 ///
-/// The string fields are copied and NUL-terminated when the client
-/// connects; an interior NUL is reported as
-/// [`ErrorKind::Usage`](crate::ErrorKind::Usage) instead of silently
-/// truncating what the server sees.
+/// String values are copied and null-terminated during connection. Interior
+/// null bytes return [`ErrorKind::Usage`](crate::ErrorKind::Usage).
 #[derive(Clone, Debug, Default)]
 pub struct ClientOpts {
     client_name: Option<String>,
     database: Option<String>,
     user: Option<String>,
     password: Option<String>,
-    /// Client version reported to the server. Cosmetic: it shows up in
-    /// `system.query_log`. Defaults to 0.0.0.
+    /// Client version reported in `system.query_log`. Default is 0.0.0.
     pub client_version_major: u64,
     pub client_version_minor: u64,
     pub client_version_patch: u64,
-    /// Native protocol revision to negotiate. 0 keeps clickhouse-c's own
-    /// default, [`sys::CHC_CLIENT_DEFAULT_REVISION`]. The server caps the
-    /// negotiated revision at its own, so asking for a newer one is safe;
-    /// asking for an older one turns off the features it gates.
+    /// Requested native protocol revision. Zero uses
+    /// [`sys::CHC_CLIENT_DEFAULT_REVISION`]. Server limits negotiated revision
+    /// to its supported value.
     pub client_revision: u64,
     pub compression: Compression,
-    /// Internal read buffer. 0 selects clickhouse-c's 8 KiB default.
+    /// Read buffer size in bytes. Zero selects clickhouse-c 8 KiB default.
     pub read_buffer_bytes: usize,
 }
 
 impl ClientOpts {
-    /// Defaults throughout: user `default`, database `default`, empty
-    /// password, no compression.
+    /// Creates settings for `default` user and database, empty password, and
+    /// no compression.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Name reported to the server, default `"clickhouse-c"`.
+    /// Sets client name. Default is `"clickhouse-c"`.
     pub fn client_name(mut self, s: &str) -> Self {
         self.client_name = Some(s.to_owned());
         self
     }
-    /// Default database for unqualified table names.
+    /// Sets default database for unqualified table names.
     pub fn database(mut self, s: &str) -> Self {
         self.database = Some(s.to_owned());
         self
     }
-    /// Account to authenticate as.
+    /// Sets account name used for authentication.
     pub fn user(mut self, s: &str) -> Self {
         self.user = Some(s.to_owned());
         self
     }
-    /// Sent in cleartext inside the Hello body: use TLS on an untrusted
-    /// network.
+    /// Sets authentication password.
+    ///
+    /// Native protocol sends password as clear text inside Hello message. Use
+    /// TLS when transport is not trusted.
     pub fn password(mut self, s: &str) -> Self {
         self.password = Some(s.to_owned());
         self
     }
 
-    /// Set all three version components at once.
+    /// Sets reported client version.
     pub fn client_version(mut self, major: u64, minor: u64, patch: u64) -> Self {
         self.client_version_major = major;
         self.client_version_minor = minor;
@@ -83,14 +82,15 @@ impl ClientOpts {
         self
     }
 
-    /// Protocol revision to ask for; see [`client_revision`](Self::client_revision).
+    /// Sets requested protocol revision.
     pub fn client_revision(mut self, revision: u64) -> Self {
         self.client_revision = revision;
         self
     }
 
-    /// Anything but [`Compression::None`] also needs a matching [`Codec`]
-    /// passed to [`Client::init`].
+    /// Sets compression algorithm.
+    ///
+    /// Compressed connections require a matching [`Codec`] in [`Client::init`].
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
@@ -149,7 +149,7 @@ impl ClientOpts {
     }
 }
 
-/// `chc_client_opts` plus the NUL-terminated copies its pointers reference.
+/// Owns raw client options and null-terminated strings referenced by them.
 pub(crate) struct RawClientOpts {
     _owned: Vec<CString>,
     raw: sys::chc_client_opts,
@@ -162,7 +162,7 @@ impl RawClientOpts {
     }
 }
 
-/// Information sent by the server during the Hello handshake.
+/// Server information received during Hello handshake.
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub name: String,
@@ -194,42 +194,29 @@ fn cstr_array_to_string(buf: &[c_char]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Open ClickHouse client. Owns the underlying `chc_client *`, the
-/// [`Io`](crate::Io) backend it talks through, and (when compressed) its
-/// [`Codec`]; Rust drop order guarantees the C-side back-pointers stay
-/// valid through close.
+/// Active blocking ClickHouse connection.
+///
+/// Client owns C connection, I/O transport, and optional compression codec.
 pub struct Client<'fd> {
     raw: NonNull<sys::chc_client>,
-    // `chc_client_init` stashes `c->al = al`, i.e. it stores a pointer
-    // back into the `chc_alloc` struct we pass in; reads & writes go
-    // through `c->al->{alloc,realloc,free}` on every subsequent call
-    // and from `chc_client_close`. The `Box` heap-allocates the alloc
-    // so its address stays stable across moves of `Self`. No `Pin` —
-    // `Allocator: Unpin`, so a bare `Box` already gives all the
-    // guarantee the C side needs.
+    // C connection retains allocator address until close
     alloc: Box<Allocator>,
     _codec: Option<Pin<Box<Codec>>>,
-    // Type-erased so the same `Client` carries either a plaintext
-    // [`PosixIo`](crate::PosixIo) or a `tls::TlsIo`. `chc_client` retains
-    // the `chc_io` pointer minted from this backend, so it must outlive
-    // the client; the box keeps it pinned through `Drop`.
+    // C connection retains callback pointer into pinned transport
     io: Pin<Box<dyn Io + Send + 'fd>>,
 }
 
 impl<'fd> Client<'fd> {
-    /// Performs Hello / HelloAck against the supplied I/O. Takes
-    /// ownership of `io` and `codec` so the C-side back-pointers
-    /// `c->io` / `c->codec` stay valid for the client's lifetime.
+    /// Creates client and completes Hello handshake using supplied transport.
     ///
-    /// `io` is any [`Io`] backend: [`PosixIo`](crate::PosixIo) for a
-    /// plaintext fd, or `tls::TlsIo` (feature `tls`) for rustls over a
-    /// `TcpStream`.
+    /// Method takes ownership of `io` and `codec`. `io` can be
+    /// [`PosixIo`](crate::PosixIo), `tls::TlsIo`, or custom [`Io`]
+    /// implementation.
     ///
-    /// `codec` may be `None` only when `opts.compression` is `None`.
+    /// `codec` can be `None` only when compression is disabled.
     ///
-    /// The `'fd` lifetime is the borrow on the file descriptor backing
-    /// `io`. `Client<'fd>` cannot outlive that fd, so dropping the fd
-    /// owner while the [`Client`] is still alive is a compile error:
+    /// Lifetime `'fd` prevents client from outliving a borrowed file
+    /// descriptor:
     ///
     /// ```compile_fail
     /// use clickhouse_c::{Allocator, Client, ClientOpts, PosixIo};
@@ -239,8 +226,7 @@ impl<'fd> Client<'fd> {
     /// fn build() -> clickhouse_c::Result<Client<'static>> {
     ///     let sock = TcpStream::connect("localhost:9000")?;
     ///     let io = PosixIo::new(sock.as_fd());
-    ///     // Client<'_> borrows `sock` through `io`; can't promote to
-    ///     // 'static because `sock` dies at the end of this scope.
+    ///     // Borrowed socket cannot produce Client<'static>.
     ///     Client::init(&ClientOpts::new(), Allocator::stdlib(), io, None)
     /// }
     /// ```
@@ -274,7 +260,7 @@ impl<'fd> Client<'fd> {
         })
     }
 
-    /// Identity the server sent during the handshake.
+    /// Returns server information received during handshake.
     pub fn server_info(&self) -> Option<ServerInfo> {
         let p = unsafe { sys::chc_client_server_info(self.raw.as_ptr().cast_const()) };
         if p.is_null() {
@@ -284,17 +270,20 @@ impl<'fd> Client<'fd> {
         }
     }
 
-    /// Set backend read timeout. Refresh before each operation when using
-    /// [`PosixIo`](crate::PosixIo), whose timeout is an absolute deadline.
+    /// Sets transport read timeout.
+    ///
+    /// [`PosixIo`](crate::PosixIo) uses an absolute deadline. Set timeout
+    /// again before each operation that requires a fresh deadline.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.io.as_mut().set_read_timeout(timeout)
     }
 
-    /// Send a query with no settings or parameters. The server applies
-    /// whatever its profile defaults to, which for a Native consumer means
-    /// trusting it not to have turned on binary type names; see
+    /// Sends a query without settings or parameters.
+    ///
+    /// Server profile supplies all query settings. Use
     /// [`QuerySetting::TEXT_TYPE_NAMES`](crate::QuerySetting::TEXT_TYPE_NAMES)
-    /// and [`send_query_with`](Self::send_query_with).
+    /// with [`send_query_with`](Self::send_query_with) when profile may enable
+    /// binary type names.
     pub fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
         let (qid, qid_len) = query_id
             .map(|q| (q.as_ptr().cast::<c_char>(), q.len()))
@@ -313,7 +302,7 @@ impl<'fd> Client<'fd> {
         check(rc, &err)
     }
 
-    /// Send a query with per-query settings and `{name:Type}` parameters.
+    /// Sends a query with settings and `{name:Type}` parameters.
     ///
     /// ```no_run
     /// use clickhouse_c::{QueryOpts, QueryParam, QuerySetting};
@@ -322,7 +311,7 @@ impl<'fd> Client<'fd> {
     ///     QuerySetting::TEXT_TYPE_NAMES,
     ///     QuerySetting::new("max_block_size", "8192"),
     /// ];
-    /// let params = [QueryParam::new("cutoff", "100")];
+    /// let params = [QueryParam::new("cutoff", "'100'")];
     /// client.send_query_with(
     ///     "SELECT number FROM numbers(1000) WHERE number > {cutoff:UInt64}",
     ///     &QueryOpts::new().settings(&settings).params(&params),
@@ -345,8 +334,9 @@ impl<'fd> Client<'fd> {
         check(rc, &err)
     }
 
-    /// Send a Data block. Passing [`None`] writes the empty block that
-    /// terminates a query / signals "no more INSERT rows".
+    /// Sends a Data block.
+    ///
+    /// `None` sends empty block that ends INSERT input.
     pub fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
         let bb_ptr = builder.map(|b| b.as_ptr()).unwrap_or(core::ptr::null());
         let mut err = sys::chc_err::zeroed();
@@ -354,32 +344,27 @@ impl<'fd> Client<'fd> {
         check(rc, &err)
     }
 
-    /// Send the protocol Cancel packet, asking the server to stop producing
-    /// rows for the query in flight. Packets already on the wire still
-    /// arrive, so keep draining until `EndOfStream`.
+    /// Sends protocol Cancel packet for active query.
     ///
-    /// This is the remote half of cancellation and needs a working
-    /// connection. To stop *reading* -- because the caller is shutting down,
-    /// or the peer went quiet -- use
-    /// [`CancelToken`](crate::CancelToken), which fails local reads and
-    /// sends nothing.
+    /// Continue receiving events until [`Event::EndOfStream`] because packets
+    /// already sent by server can still arrive. Use [`CancelToken`](crate::CancelToken)
+    /// to cancel local reads without sending a packet.
     pub fn send_cancel(&mut self) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_send_cancel(self.raw.as_ptr(), &mut err) };
         check(rc, &err)
     }
 
-    /// Send a Ping. The server answers [`Event::Pong`]; useful for probing
-    /// a connection between queries.
+    /// Sends Ping packet. Server responds with [`Event::Pong`].
     pub fn send_ping(&mut self) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_send_ping(self.raw.as_ptr(), &mut err) };
         check(rc, &err)
     }
 
-    /// Read the next server event, blocking until a full packet arrives.
-    /// Any block / exception payload is owned by the returned [`Event`]
-    /// and freed on drop.
+    /// Reads next server event and blocks until complete packet arrives.
+    ///
+    /// Returned event owns block or exception payload.
     pub fn recv_event(&mut self) -> Result<Event> {
         let mut raw = sys::chc_packet::zeroed();
         let mut err = sys::chc_err::zeroed();
@@ -402,40 +387,38 @@ impl<'fd> Drop for Client<'fd> {
 
 unsafe impl<'fd> Send for Client<'fd> {}
 
-/// Server-side exception. Owning wrapper around the C `chc_exception`.
-/// [`Drop`] calls `chc_exception_free`.
+/// Exception returned by ClickHouse server.
 pub struct Exception {
     raw: NonNull<sys::chc_exception>,
     alloc: Allocator,
 }
 
 impl Exception {
-    /// SAFETY: `raw` must point at a `chc_exception` owned by the caller;
-    /// `alloc` must be the allocator it was created with.
+    /// SAFETY: caller must own `raw`, and `alloc` must match its allocator
     pub(crate) unsafe fn from_raw(raw: NonNull<sys::chc_exception>, alloc: Allocator) -> Self {
         Self { raw, alloc }
     }
 
-    /// ClickHouse error code, matching `system.errors`.
+    /// Returns ClickHouse error code from `system.errors`.
     pub fn code(&self) -> i32 {
         unsafe { (*self.raw.as_ptr()).code }
     }
 
-    /// Exception class name. Server-controlled bytes, not UTF-8-validated.
+    /// Returns exception class name without UTF-8 validation.
     pub fn name(&self) -> &[u8] {
         let r = unsafe { self.raw.as_ref() };
         cstr_bytes(r.name, r.name_len)
     }
 
-    /// Human-readable message. Server-controlled bytes, not
-    /// UTF-8-validated.
+    /// Returns exception message without UTF-8 validation.
     pub fn display_text(&self) -> &[u8] {
         let r = unsafe { self.raw.as_ref() };
         cstr_bytes(r.display_text, r.display_text_len)
     }
 
-    /// Server stack trace, empty unless the server was asked for one.
-    /// Server-controlled bytes, not UTF-8-validated.
+    /// Returns server stack trace without UTF-8 validation.
+    ///
+    /// Value is empty unless query requested a stack trace.
     pub fn stack_trace(&self) -> &[u8] {
         let r = unsafe { self.raw.as_ref() };
         cstr_bytes(r.stack_trace, r.stack_trace_len)
@@ -500,8 +483,9 @@ fn cstr_bytes<'a>(ptr: *mut c_char, len: usize) -> &'a [u8] {
     unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) }
 }
 
-/// Server-to-client packet tags. `CHC_PKT_HELLO` has no variant: the Hello
-/// exchange happens inside [`Client::init`], never as a received packet.
+/// Server packet kind.
+///
+/// Hello packets are handled during [`Client::init`] and do not have a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum PacketKind {
@@ -537,40 +521,37 @@ impl PacketKind {
     }
 }
 
-/// Owned server event from the packet loop, shared by [`Client`] and the
-/// async client. Any block / exception payload is owned here and freed on
-/// drop. Reading the `kind`-selected union arm happens once, in
-/// `Event::from_raw`, so consumers never touch the raw union.
+/// Event received from server.
+///
+/// Event owns any block or exception payload.
 pub enum Event {
-    /// A result block, or an INSERT's expected-structure block.
+    /// Result block or expected INSERT structure.
     Data(Block),
-    /// The `WITH TOTALS` row.
+    /// Row produced by `WITH TOTALS`.
     Totals(Block),
-    /// The `WITH EXTREMES` min/max rows.
+    /// Minimum and maximum rows produced by `WITH EXTREMES`.
     Extremes(Block),
-    /// Server log lines, when `send_logs_level` asks for them.
+    /// Server log rows requested by `send_logs_level`.
     Log(Block),
-    /// Per-query profile-event counters.
+    /// Per-query profile event counters.
     ProfileEvents(Block),
-    /// The query failed. Nothing more arrives on this query.
+    /// Server exception that ends current query.
     Exception(Exception),
-    /// Incremental read/write counters; sent repeatedly during a query.
+    /// Incremental read and write counters.
     Progress(Progress),
-    /// Row and byte totals, sent once near the end of a query.
+    /// Row and byte totals sent near query completion.
     ProfileInfo(ProfileInfo),
-    /// Reply to [`Client::send_ping`].
+    /// Response to [`Client::send_ping`].
     Pong,
-    /// The query is done. Stop draining.
+    /// Query completion marker.
     EndOfStream,
-    /// Column metadata for an INSERT target. The payload is not decoded;
-    /// the following Data block carries the same structure.
+    /// INSERT target metadata. Payload is not decoded. Following Data block
+    /// contains same structure.
     TableColumns,
 }
 
 impl Event {
-    /// Consume a recv'd packet, taking ownership of its payload. `raw`
-    /// must come straight from `chc_*_recv_packet`; arms are read only
-    /// after `kind` selects them, so no union read is unsound.
+    /// Converts received C packet and takes ownership of its payload.
     pub(crate) fn from_raw(raw: &mut sys::chc_packet, alloc: Allocator) -> Result<Self> {
         let Some(kind) = PacketKind::from_raw(raw.kind) else {
             return Err(Error::new(
@@ -586,11 +567,11 @@ impl Event {
             PacketKind::ProfileEvents => Self::ProfileEvents(take_block(raw, alloc)?),
             PacketKind::Exception => Self::Exception(take_exception(raw, alloc)?),
             PacketKind::Progress => {
-                // SAFETY: kind selects the `progress` arm.
+                // SAFETY: packet kind selects progress union member
                 Self::Progress(Progress::from_raw(unsafe { &raw.payload.progress }))
             }
             PacketKind::ProfileInfo => {
-                // SAFETY: kind selects the `profile` arm.
+                // SAFETY: packet kind selects profile union member
                 Self::ProfileInfo(ProfileInfo::from_raw(unsafe { &raw.payload.profile }))
             }
             PacketKind::Pong => Self::Pong,
@@ -601,25 +582,24 @@ impl Event {
 }
 
 fn take_block(raw: &mut sys::chc_packet, alloc: Allocator) -> Result<Block> {
-    // SAFETY: caller's kind match selected the `block` arm.
+    // SAFETY: caller matched block packet kind
     let p = unsafe { raw.payload.block };
     raw.payload.block = core::ptr::null_mut();
-    // SAFETY: ownership transfer; alloc matches the recv'ing client.
+    // SAFETY: allocator belongs to client that received block
     unsafe { Block::from_raw(p, alloc) }
         .ok_or_else(|| Error::new(ErrorKind::Protocol, "block packet missing block"))
 }
 
 fn take_exception(raw: &mut sys::chc_packet, alloc: Allocator) -> Result<Exception> {
-    // SAFETY: caller's kind match selected the `exception` arm.
+    // SAFETY: caller matched exception packet kind
     let p = NonNull::new(unsafe { raw.payload.exception })
         .ok_or_else(|| Error::new(ErrorKind::Protocol, "exception packet missing exception"))?;
     raw.payload.exception = core::ptr::null_mut();
-    // SAFETY: ownership transfer; alloc matches the recv'ing client.
+    // SAFETY: allocator belongs to client that received exception
     Ok(unsafe { Exception::from_raw(p, alloc) })
 }
 
-/// Incremental counters for the query in flight. Each packet reports a
-/// delta, not a running total.
+/// Incremental query counters. Each packet contains a delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
     pub rows: u64,
@@ -641,7 +621,7 @@ impl Progress {
     }
 }
 
-/// End-of-query totals.
+/// Query totals reported near completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileInfo {
     pub rows: u64,
@@ -670,8 +650,7 @@ mod tests {
     use super::ClientOpts;
     use crate::{Compression, ErrorKind};
 
-    /// Without a codec feature there is no built-in codec to mismatch, so
-    /// only the missing-codec half is reachable.
+    /// Compression always requires a codec, including builds without codecs
     #[test]
     fn compression_without_a_codec_is_a_usage_error() {
         let err = ClientOpts::new()

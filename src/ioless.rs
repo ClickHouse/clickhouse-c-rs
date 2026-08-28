@@ -1,16 +1,8 @@
-//! Runtime-neutral protocol machine.
+//! Transport-independent native protocol client.
 //!
-//! [`IolessClient`] speaks the whole native TCP protocol and performs no I/O
-//! at all. The caller hands it the bytes that arrived and takes the bytes it
-//! wants sent, so the transport can be anything: `async-std`, `smol`,
-//! `io_uring`, an embedded event loop, a `Vec<u8>` in a test.
-//!
-//! Every step that could run past the submitted bytes returns
-//! [`Step::NeedsInput`] rather than blocking, and resumes mid-block once more
-//! bytes arrive.
-//!
-//! The [`AsyncClient`](crate::AsyncClient) tokio adapter is this type plus a
-//! byte pump; anything it does, a caller can do against another runtime.
+//! [`IolessClient`] processes protocol bytes without reading or writing a
+//! transport. Callers submit received bytes and consume bytes queued for
+//! sending. Operations return [`Step::NeedsInput`] when more data is required.
 
 use core::pin::Pin;
 use core::ptr::NonNull;
@@ -24,13 +16,12 @@ use crate::codec::Codec;
 use crate::error::{Result, check};
 use crate::sys;
 
-/// A step that either finished or ran out of input.
+/// Result of a protocol operation that may require more input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step<T> {
     Ready(T),
-    /// The parser reached the end of the submitted bytes mid-item. Read more
-    /// from the transport, hand them to [`IolessClient::submit`], and call the
-    /// same method again.
+    /// Operation requires more bytes. Submit them with
+    /// [`IolessClient::submit`] and repeat operation.
     NeedsInput,
 }
 
@@ -47,7 +38,7 @@ impl<T> Step<T> {
     }
 }
 
-/// The native protocol, with the socket left to the caller.
+/// Native protocol client without transport I/O.
 ///
 /// ```no_run
 /// use clickhouse_c::{Allocator, ClientOpts, Event, IolessClient, Step};
@@ -59,9 +50,7 @@ impl<T> Step<T> {
 /// let mut core = IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None)?;
 /// let mut buf = [0u8; 8192];
 ///
-/// // Push everything queued, then read once. Flushing before the read is not
-/// // optional: a step that reports NeedsInput has usually just queued the
-/// // bytes the server is waiting on, and reading first deadlocks both sides.
+/// // Send queued bytes before waiting for more input.
 /// let mut pump = |core: &mut IolessClient, sock: &mut TcpStream| -> clickhouse_c::Result<()> {
 ///     while !core.pending_out().is_empty() {
 ///         let n = sock.write(core.pending_out())?;
@@ -88,15 +77,14 @@ impl<T> Step<T> {
 /// ```
 pub struct IolessClient {
     raw: NonNull<sys::chc_async_client>,
-    // The C side stores this address and calls through it until free, so it is
-    // boxed rather than held inline where a move of `Self` would relocate it.
+    // C client retains allocator address until destruction
     alloc: Box<Allocator>,
     _codec: Option<Pin<Box<Codec>>>,
 }
 
 impl IolessClient {
-    /// Build the machine. Does no I/O, so it cannot fail on the network; run
-    /// [`handshake`](Self::handshake) next.
+    /// Creates protocol client. Call [`handshake`](Self::handshake) before
+    /// sending queries.
     pub fn new(
         opts: &ClientOpts,
         alloc: Allocator,
@@ -119,8 +107,7 @@ impl IolessClient {
         })
     }
 
-    /// Hand over bytes read from the transport. Copied into the parser's
-    /// staging buffer, so `bytes` can be reused immediately.
+    /// Copies received transport bytes into protocol input buffer.
     pub fn submit(&mut self, bytes: &[u8]) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
@@ -134,11 +121,10 @@ impl IolessClient {
         check(rc, &err)
     }
 
-    /// Bytes queued for the transport, empty when there is nothing to send.
+    /// Returns bytes waiting to be written to transport.
     ///
-    /// Sends never block or apply backpressure, so watch this length and stop
-    /// issuing sends when it grows past what the application is willing to
-    /// buffer.
+    /// Send methods append to this buffer without backpressure. Callers should
+    /// limit queued operations according to their memory requirements.
     pub fn pending_out(&self) -> &[u8] {
         let mut ptr: *const u8 = core::ptr::null();
         let mut len = 0usize;
@@ -146,28 +132,28 @@ impl IolessClient {
         if ptr.is_null() || len == 0 {
             return &[];
         }
-        // SAFETY: C owns the buffer and keeps it alive and unchanged until the
-        // next call that mutates the machine, which needs &mut self.
+        // SAFETY: C buffer remains unchanged until next mutable operation
         unsafe { slice::from_raw_parts(ptr, len) }
     }
 
-    /// Drop the first `n` bytes of [`pending_out`](Self::pending_out) after
-    /// the transport accepted them. A partial write is fine. `n` past what is
-    /// queued is clamped.
+    /// Removes first `n` bytes after transport accepts them.
+    ///
+    /// Values larger than queued length remove all queued bytes.
     pub fn consume_out(&mut self, n: usize) {
         unsafe { sys::chc_async_consume_out(self.raw.as_ptr(), n) };
     }
 
-    /// Advance the Hello exchange. Call until it reports
-    /// [`Step::Ready`](Step::Ready), pumping bytes both ways in between.
+    /// Advances Hello exchange. Repeat after sending output and submitting
+    /// input until method returns [`Step::Ready`].
     pub fn handshake(&mut self) -> Result<Step<()>> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_async_handshake(self.raw.as_ptr(), &mut err) };
         step(rc, &err).map(|s| s.map_ready(|()| ()))
     }
 
-    /// Queue a query. Settings and parameters are not reachable here:
-    /// clickhouse-c publishes no `chc_async_send_query_ex`.
+    /// Queues a query.
+    ///
+    /// I/O-independent C API does not support query settings or parameters.
     pub fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
         let (qid, qid_len) = query_id
             .map(|q| (q.as_ptr().cast::<c_char>(), q.len()))
@@ -186,7 +172,7 @@ impl IolessClient {
         check(rc, &err)
     }
 
-    /// Queue a Data block, or the empty terminator with [`None`].
+    /// Queues a Data block, or empty terminator when `builder` is `None`.
     pub fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
         let bb_ptr = builder.map(|b| b.as_ptr()).unwrap_or(core::ptr::null());
         let mut err = sys::chc_err::zeroed();
@@ -194,15 +180,16 @@ impl IolessClient {
         check(rc, &err)
     }
 
-    /// Close an INSERT's data stream.
+    /// Queues empty Data block that ends INSERT input.
     pub fn send_data_end(&mut self) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_async_send_data_end(self.raw.as_ptr(), &mut err) };
         check(rc, &err)
     }
 
-    /// Take the next server event out of the submitted bytes. Any block or
-    /// exception payload is owned by the returned [`Event`].
+    /// Decodes next server event from submitted bytes.
+    ///
+    /// Returned event owns block or exception payload.
     pub fn recv_event(&mut self) -> Result<Step<Event>> {
         let mut raw = sys::chc_packet::zeroed();
         let mut err = sys::chc_err::zeroed();
@@ -219,14 +206,11 @@ impl IolessClient {
         event.map(Step::Ready)
     }
 
-    /// Identity the server sent.
+    /// Returns server identity information.
     ///
-    /// Unlike [`Client::server_info`](crate::Client::server_info), this
-    /// returns `Some` before the handshake too: clickhouse-c hands back its
-    /// own slot, whose name is empty and whose revision is seeded with the
-    /// requested one so block framing is defined from the first byte. Read it
-    /// after [`handshake`](Self::handshake) reports
-    /// [`Step::Ready`](Step::Ready).
+    /// Before handshake completes, value contains empty name and requested
+    /// revision. Read value after [`handshake`](Self::handshake) returns
+    /// [`Step::Ready`] to obtain server-provided information.
     pub fn server_info(&self) -> Option<ServerInfo> {
         let p = unsafe { sys::chc_async_server_info(self.raw.as_ptr().cast_const()) };
         if p.is_null() {
@@ -260,7 +244,5 @@ impl Drop for IolessClient {
     }
 }
 
-// The raw pointer is to a heap machine this handle uniquely owns; C only ever
-// touches it from the thread calling in, and every mutating method takes
-// &mut self.
+// C client is uniquely owned and used from one thread at a time
 unsafe impl Send for IolessClient {}

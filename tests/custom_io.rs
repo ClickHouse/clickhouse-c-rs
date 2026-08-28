@@ -1,10 +1,7 @@
-//! A third-party [`Io`] backend, and a Native round-trip through it.
+//! Custom in-memory [`Io`] implementation and Native round-trip tests.
 //!
-//! Nothing here touches a socket, a pipe, or the `clickhouse` binary: the
-//! block is encoded into a `Vec<u8>` and decoded straight back out. That is
-//! the point — a caller can write their own transport (OpenSSL, io_uring, an
-//! event loop, a buffer) against the public `Io` contract, and the same
-//! `BlockBuilder` / `BlockReader` drive it.
+//! Tests encode and decode blocks through public transport interface without
+//! external processes.
 
 use core::ffi::{c_int, c_void};
 use core::marker::PhantomPinned;
@@ -15,9 +12,9 @@ use clickhouse_c::{
     TypeAst, sys,
 };
 
-/// Reads from and writes to one `Vec<u8>`: writes append, reads consume from
-/// the front. Self-referential, like every `chc_io` backend — the vtable's
-/// `ud` points back here — so it lives behind a `Pin<Box<_>>`.
+/// In-memory transport backed by a byte vector.
+///
+/// Value is pinned because callback context points to this structure.
 struct MemIo {
     io: sys::chc_io,
     buf: Vec<u8>,
@@ -38,7 +35,7 @@ impl MemIo {
             read_at: 0,
             _pin: PhantomPinned,
         });
-        // SAFETY: sets a field at the pinned address; never moves out.
+        // SAFETY: set context after address becomes stable
         unsafe {
             let this = boxed.as_mut().get_unchecked_mut();
             this.io.ud = (this as *mut Self).cast();
@@ -51,18 +48,15 @@ impl MemIo {
     }
 }
 
-// SAFETY: `io` is a fully wired chc_io embedded in the pinned MemIo; `ud`
-// back-points at the same node, whose address is fixed under Pin, and the
-// callbacks honour the read/write contract below.
+// SAFETY: callback table and context remain valid within pinned MemIo
 unsafe impl Io for MemIo {
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
-        // SAFETY: field pointer; does not move self.
+        // SAFETY: returning field address does not move pinned value
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
 }
 
-/// Fills up to `len` bytes and reports the count. 0 is a clean EOF, which is
-/// what `BlockReader::read` turns into `Ok(None)` at a block boundary.
+/// Reads up to `len` bytes and reports zero at EOF.
 unsafe extern "C" fn mem_read(
     ud: *mut c_void,
     buf: *mut c_void,
@@ -82,8 +76,7 @@ unsafe extern "C" fn mem_read(
     sys::CHC_OK
 }
 
-/// Writes all `len` bytes or fails; a short write is not part of the
-/// contract.
+/// Appends all input bytes.
 unsafe extern "C" fn mem_write(
     ud: *mut c_void,
     buf: *const c_void,
@@ -96,17 +89,14 @@ unsafe extern "C" fn mem_write(
     sys::CHC_OK
 }
 
-/// `Array(Nullable(UInt32))` alongside a `LowCardinality(String)`: between
-/// them they cover every physical layout the writer builds except Tuple,
-/// which the LowCardinality dictionary and the array offsets already stress
-/// in composition.
+/// Round-trips nested nullable array and LowCardinality string columns.
 #[test]
 fn composite_block_round_trips_through_a_custom_backend() {
     let alloc = Allocator::stdlib();
     let array_ty = TypeAst::parse("Array(Nullable(UInt32))", alloc).expect("array type");
     let lc_ty = TypeAst::parse("LowCardinality(String)", alloc).expect("lc type");
 
-    // Three arrays over four elements: [10, NULL], [], [30, 40].
+    // Three arrays contain four total nullable elements
     let values: Vec<u8> = [10u32, 0, 30, 40]
         .iter()
         .flat_map(|v| v.to_le_bytes())
@@ -114,7 +104,7 @@ fn composite_block_round_trips_through_a_custom_backend() {
     let null_map = [0u8, 1, 0, 0];
     let array_offsets = [2u64, 2, 4];
 
-    // Dictionary "alpha" / "beta", keys pick alpha, beta, alpha.
+    // Keys select alpha, beta, and alpha
     let dict_data = b"alphabeta";
     let dict_offsets = [5u64, 9];
     let keys = [0u8, 1, 0];
@@ -172,13 +162,11 @@ fn composite_block_round_trips_through_a_custom_backend() {
     assert_eq!(offsets, &dict_offsets[..]);
     assert_eq!(data, &dict_data[..]);
 
-    // Nothing follows the single block, so the next read is a clean EOF.
+    // Next read reaches EOF at block boundary
     assert!(reader.read().expect("eof read").is_none());
 }
 
-/// Two blocks written back to back must both come out of one reader: the
-/// reader buffers past a block boundary, and a fresh reader per block would
-/// drop that tail.
+/// Verifies one reader preserves buffered data between consecutive blocks.
 #[test]
 fn successive_blocks_share_one_reader() {
     let alloc = Allocator::stdlib();

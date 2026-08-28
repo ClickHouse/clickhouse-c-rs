@@ -1,4 +1,4 @@
-//! Decode a `clickhouse local` query through clickhouse-c-rs.
+//! Runs a `clickhouse local` query and decodes Native output.
 //!
 //! ```sh
 //! cargo run --example spawn_clickhouse_local -- "SELECT number, toString(number*number) FROM numbers(5)"
