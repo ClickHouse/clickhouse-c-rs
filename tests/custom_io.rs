@@ -9,7 +9,7 @@ use core::pin::Pin;
 
 use clickhouse_c::{
     Allocator, BlockBuilder, BlockOpts, BlockReader, ColumnBuilder, ColumnLayout, Io, Kind,
-    TypeAst, sys,
+    SliceIo, TypeAst, sys,
 };
 
 /// In-memory transport backed by a byte vector.
@@ -194,4 +194,103 @@ fn successive_blocks_share_one_reader() {
         );
     }
     assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+}
+
+/// Re-emits a decoded column beside a locally built one, without visiting values.
+#[test]
+fn decoded_column_splices_beside_a_local_column() {
+    let alloc = Allocator::stdlib();
+    let map_ty = TypeAst::parse("Map(String, Nullable(String))", alloc).expect("map type");
+    let id_ty = TypeAst::parse("UInt64", alloc).expect("id type");
+
+    // Two rows hold three pairs: {a=>x, b=>NULL} and {c=>z}
+    let key_data = b"abc";
+    let key_offsets = [1u64, 2, 3];
+    let val_data = b"xz";
+    let val_offsets = [1u64, 1, 2];
+    let val_nulls = [0u8, 1, 0];
+    let entry_offsets = [2u64, 3];
+
+    let keys = ColumnBuilder::string(&key_offsets, key_data, 3).expect("keys");
+    let val_leaf = ColumnBuilder::string(&val_offsets, val_data, 3).expect("val leaf");
+    let vals = val_leaf.nullable(&val_nulls).expect("vals");
+    let children = [keys, vals];
+    let mut ptrs = [core::ptr::null_mut(); 2];
+    let tuple = ColumnBuilder::tuple(&children, &mut ptrs).expect("tuple");
+    let map = tuple.array(&entry_offsets, 2).expect("map");
+
+    let mut source = BlockBuilder::new();
+    source.append("kv", map_ty.view(), &map).expect("append kv");
+    let mut wio = MemIo::new();
+    source
+        .write(wio.as_mut(), BlockOpts::default())
+        .expect("write source");
+    let native = wio.as_ref().written().to_vec();
+
+    // Decode partial block, then re-emit it beside a column built here
+    let mut rio = SliceIo::new(&native);
+    let mut reader = BlockReader::new(rio.as_mut(), alloc, BlockOpts::default()).expect("reader");
+    let decoded = reader.read().expect("read").expect("one block");
+    decoded.validate().expect("validate");
+    assert!(reader.read().expect("eof read").is_none());
+    drop(reader);
+
+    let ids: Vec<u8> = [7u64, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let id_col = ColumnBuilder::fixed(&ids, 8, 2).expect("id col");
+    let mut merged = BlockBuilder::new();
+    merged
+        .append("id", id_ty.view(), &id_col)
+        .expect("append id");
+    merged
+        .append_column("kv", map_ty.view(), decoded.column(0).expect("kv column"))
+        .expect("append kv column");
+
+    let mut mio = MemIo::new();
+    merged
+        .write(mio.as_mut(), BlockOpts::default())
+        .expect("write merged");
+    let mut reader = BlockReader::new(mio.as_mut(), alloc, BlockOpts::default()).expect("reader");
+    let out = reader.read().expect("read").expect("one block");
+    out.validate().expect("validate");
+
+    assert_eq!(out.n_rows(), 2);
+    assert_eq!(out.column_name(0), Some(&b"id"[..]));
+    assert_eq!(out.column_name(1), Some(&b"kv"[..]));
+    let kv = out.column(1).expect("kv");
+    assert_eq!(kv.array_offsets(), Some(&entry_offsets[..]));
+    let pairs = kv.array_values().expect("pairs");
+    let (koff, kdata) = pairs.tuple_child(0).and_then(|c| c.string()).expect("keys");
+    assert_eq!((koff, kdata), (&key_offsets[..], &key_data[..]));
+    let vcol = pairs.tuple_child(1).expect("vals");
+    assert_eq!(vcol.null_map(), Some(&val_nulls[..]));
+}
+
+/// Rejects a decoded column whose row count disagrees with the block.
+#[test]
+fn append_column_rejects_row_count_mismatch() {
+    let alloc = Allocator::stdlib();
+    let ty = TypeAst::parse("UInt32", alloc).expect("type");
+
+    let two: Vec<u8> = [1u32, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let col = ColumnBuilder::fixed(&two, 4, 2).expect("col");
+    let mut source = BlockBuilder::new();
+    source.append("x", ty.view(), &col).expect("append");
+    let mut wio = MemIo::new();
+    source
+        .write(wio.as_mut(), BlockOpts::default())
+        .expect("write");
+    let native = wio.as_ref().written().to_vec();
+
+    let mut rio = SliceIo::new(&native);
+    let mut reader = BlockReader::new(rio.as_mut(), alloc, BlockOpts::default()).expect("reader");
+    let decoded = reader.read().expect("read").expect("one block");
+
+    let three: Vec<u8> = [1u32, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let local = ColumnBuilder::fixed(&three, 4, 3).expect("local");
+    let mut merged = BlockBuilder::new();
+    merged.append("y", ty.view(), &local).expect("append y");
+    let err = merged
+        .append_column("x", ty.view(), decoded.column(0).expect("x"))
+        .expect_err("row count mismatch");
+    assert!(err.to_string().contains("row count mismatch"), "{err}");
 }

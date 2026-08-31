@@ -8,7 +8,7 @@ use core::ffi::c_int;
 use core::marker::PhantomData;
 use core::pin::Pin;
 
-use crate::block::BlockOpts;
+use crate::block::{BlockOpts, Column};
 use crate::error::{Error, ErrorKind, Result, check};
 use crate::io::Io;
 use crate::sys;
@@ -196,7 +196,16 @@ impl<'a> BlockBuilder<'a> {
         ty: TypeRef<'a>,
         col: &'a ColumnBuilder<'a>,
     ) -> Result<()> {
-        let n_rows = col.n_rows();
+        self.push(name, ty, col.node_ptr(), col.n_rows())
+    }
+
+    fn push(
+        &mut self,
+        name: &'a str,
+        ty: TypeRef<'a>,
+        col: *const sys::chc_column,
+        n_rows: usize,
+    ) -> Result<()> {
         match self.n_rows {
             Some(prev) if prev != n_rows => {
                 return Err(usage(format!(
@@ -205,18 +214,27 @@ impl<'a> BlockBuilder<'a> {
             }
             _ => self.n_rows = Some(n_rows),
         }
-        let col_ptr = col.node_ptr();
         self.cols.push(sys::chc_block_col {
             name: name.as_ptr().cast(),
             name_len: name.len(),
             type_: ty.raw,
-            col: col_ptr,
+            col,
         });
         // Refresh pointer after possible Vec reallocation
         self.raw.cols = self.cols.as_mut_ptr();
         self.raw.n_cols = self.cols.len();
         self.raw.n_rows = n_rows;
         Ok(())
+    }
+
+    /// Adds a named column backed by a decoded [`Column`].
+    ///
+    /// Re-emits a column read by [`BlockReader`](crate::BlockReader) without
+    /// visiting its values. Builder borrows column tree, so owning
+    /// [`Block`](crate::Block) must outlive builder. `ty` describes column as
+    /// writer must encode it; writer rejects a tree that does not match.
+    pub fn append_column(&mut self, name: &'a str, ty: TypeRef<'a>, col: Column<'a>) -> Result<()> {
+        self.push(name, ty, col.raw, col.n_rows())
     }
 
     /// Writes block through an [`Io`] implementation.

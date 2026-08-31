@@ -71,7 +71,7 @@ pub use client::{
 };
 pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};
-pub use io::{CancelToken, Io, PosixIo};
+pub use io::{CancelToken, Io, PosixIo, SliceIo};
 pub use ioless::{IolessClient, Step};
 pub use query::{QueryOpts, QueryParam, QuerySetting};
 pub use types::{Kind, TypeAst, TypeRef};

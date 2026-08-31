@@ -5,7 +5,7 @@
 //! values are pinned because C callback state can contain pointers to fields
 //! within each value.
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
 use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -208,3 +208,104 @@ unsafe impl<'fd> Io for PosixIo<'fd> {
 
 // C client uses transport from one thread at a time, file descriptors support transfer
 unsafe impl<'fd> Send for PosixIo<'fd> {}
+
+/// Read-only transport over a borrowed byte slice.
+///
+/// Reads return bytes in order and report EOF past end. Writes fail, so this
+/// transport suits [`BlockReader`](crate::BlockReader) over Native bytes
+/// already in memory.
+pub struct SliceIo<'a> {
+    io: sys::chc_io,
+    bytes: &'a [u8],
+    read_at: usize,
+    _pin: PhantomPinned,
+}
+
+impl<'a> SliceIo<'a> {
+    pub fn new(bytes: &'a [u8]) -> Pin<Box<Self>> {
+        let mut boxed = Box::pin(Self {
+            io: sys::chc_io {
+                ud: core::ptr::null_mut(),
+                read: Some(slice_read),
+                write: Some(slice_write),
+                check_cancel: None,
+            },
+            bytes,
+            read_at: 0,
+            _pin: PhantomPinned,
+        });
+        // SAFETY: context set after address becomes stable, value stays pinned
+        unsafe {
+            let this = boxed.as_mut().get_unchecked_mut();
+            this.io.ud = (this as *mut Self).cast();
+        }
+        boxed
+    }
+
+    /// Returns bytes not yet handed to a reader.
+    ///
+    /// A reader buffers ahead, so a nonzero count does not prove unread input.
+    pub fn remaining(self: Pin<&Self>) -> usize {
+        let this = self.get_ref();
+        this.bytes.len() - this.read_at
+    }
+}
+
+/// Copies next bytes and reports zero count at end of slice.
+unsafe extern "C" fn slice_read(
+    ud: *mut c_void,
+    buf: *mut c_void,
+    len: usize,
+    out_n: *mut usize,
+    _err: *mut sys::chc_err,
+) -> c_int {
+    // SAFETY: context points to pinned SliceIo owning this callback table
+    let this = unsafe { &mut *ud.cast::<SliceIo<'_>>() };
+    let n = len.min(this.bytes.len() - this.read_at);
+    if n > 0 {
+        // SAFETY: caller guarantees `len` writable bytes, `n` bounded by source
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                this.bytes[this.read_at..].as_ptr(),
+                buf.cast::<u8>(),
+                n,
+            );
+        }
+        this.read_at += n;
+    }
+    // SAFETY: caller supplies writable count slot
+    unsafe { *out_n = n };
+    sys::CHC_OK
+}
+
+/// Rejects writes; slice transport is read-only.
+unsafe extern "C" fn slice_write(
+    _ud: *mut c_void,
+    _buf: *const c_void,
+    _len: usize,
+    err: *mut sys::chc_err,
+) -> c_int {
+    const MSG: &[u8] = b"slice transport is read-only";
+    if !err.is_null() {
+        // SAFETY: caller supplies writable error slot
+        let e = unsafe { &mut *err };
+        e.server_code = 0;
+        let n = MSG.len().min(e.msg.len() - 1);
+        for (slot, b) in e.msg.iter_mut().zip(&MSG[..n]) {
+            *slot = *b as core::ffi::c_char;
+        }
+        e.msg[n] = 0;
+    }
+    sys::CHC_ERR_IO
+}
+
+// C reader uses transport from one thread at a time
+unsafe impl Send for SliceIo<'_> {}
+
+// SAFETY: initialized callback table and slice remain pinned together
+unsafe impl Io for SliceIo<'_> {
+    fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
+        // SAFETY: returning field address does not move pinned value
+        unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
+    }
+}
