@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use clickhouse_c::{
     Allocator, Block, BlockBuilder, BlockOpts, BlockReader, CancelToken, Client, ClientOpts, Codec,
     Column, ColumnBuilder, ColumnLayout, Compression, Event, Kind, PosixIo, QueryOpts, QueryParam,
-    QuerySetting, TypeAst, TypeRef,
+    QuerySetting, SliceIo, TypeAst, TypeRef,
 };
 
 type DocResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -210,6 +210,34 @@ fn native_without_a_server() -> DocResult {
     while let Some(block) = reader.read()? {
         print_block(&block);
     }
+    Ok(())
+}
+
+// Reading Native from memory
+
+fn reading_native_from_a_slice(native_bytes: &[u8]) -> DocResult {
+    let mut io = SliceIo::new(native_bytes);
+    let mut reader = BlockReader::new(io.as_mut(), Allocator::stdlib(), BlockOpts::default())?;
+    let block = reader.read()?.expect("one block");
+    print_block(&block);
+    // Clean EOF proves the input held exactly one block
+    assert!(reader.read()?.is_none());
+    Ok(())
+}
+
+// Re-emitting a decoded column
+
+fn re_emitting_a_decoded_column(
+    decoded: &Block,
+    local_id_column: &ColumnBuilder<'_>,
+    id_ty: TypeRef<'_>,
+    payload_ty: TypeRef<'_>,
+    io: core::pin::Pin<&mut PosixIo<'_>>,
+) -> DocResult {
+    let mut out = BlockBuilder::new();
+    out.append("id", id_ty, local_id_column)?;
+    out.append_column("payload", payload_ty, decoded.column(0).expect("payload"))?;
+    out.write(io, BlockOpts::default())?;
     Ok(())
 }
 

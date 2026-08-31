@@ -358,6 +358,36 @@ while let Some(block) = reader.read()? {
 writes neither, so the default is right; the TCP path sets them from the
 negotiated server revision, which `Client` handles for you.
 
+For Native bytes already in memory, `SliceIo` reads them without a file
+descriptor. It refuses writes, so it pairs with `BlockReader` only.
+
+```rust
+use clickhouse_c::SliceIo;
+
+let mut io = SliceIo::new(&native_bytes);
+let mut reader = BlockReader::new(io.as_mut(), Allocator::stdlib(), BlockOpts::default())?;
+let block = reader.read()?.expect("one block");
+// Clean EOF proves the input held exactly one block
+assert!(reader.read()?.is_none());
+```
+
+## Re-emitting a decoded column {#re-emitting-a-decoded-column}
+
+`BlockBuilder::append_column` takes a `Column` straight off a decoded `Block`,
+so a column read from one stream goes out on another without touching its
+values. Offsets, null maps, and nested children pass through as they arrived.
+
+```rust
+let mut out = BlockBuilder::new();
+out.append("id", id_ty.view(), &local_id_column)?;
+out.append_column("payload", payload_ty.view(), decoded.column(0).expect("payload"))?;
+out.write(io.as_mut(), BlockOpts::default())?;
+```
+
+The builder borrows the column tree, so the owning `Block` must outlive it.
+`ty` is the type the writer encodes against, and it rejects a tree that does not
+match — pass the type the destination expects, not one read back off the wire.
+
 ## Custom transports {#custom-transports}
 
 `Io` is the one trait behind `Client`, `BlockReader`, and
