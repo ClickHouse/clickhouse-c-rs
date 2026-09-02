@@ -215,6 +215,9 @@ impl<'fd> Client<'fd> {
     ///
     /// `codec` can be `None` only when compression is disabled.
     ///
+    /// Server rejection returns [`ErrorKind::Server`] carrying exception code,
+    /// class, and untruncated message.
+    ///
     /// Lifetime `'fd` prevents client from outliving a borrowed file
     /// descriptor:
     ///
@@ -241,6 +244,7 @@ impl<'fd> Client<'fd> {
         let raw_opts = opts.to_raw(codec_ptr)?;
         let alloc = Box::new(alloc);
         let mut out: *mut sys::chc_client = core::ptr::null_mut();
+        let mut exc: *mut sys::chc_exception = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_client_init(
@@ -248,9 +252,13 @@ impl<'fd> Client<'fd> {
                 raw_opts.as_ptr(),
                 alloc.as_ptr(),
                 io.as_mut().io_ptr(),
+                &mut exc,
                 &mut err,
             )
         };
+        if let Some(e) = take_handshake_exception(exc, *alloc) {
+            return Err(e);
+        }
         check(rc, &err)?;
         Ok(Self {
             raw: NonNull::new(out).expect("chc_client_init returned OK with NULL"),
@@ -470,6 +478,18 @@ impl From<Exception> for Error {
             server_name: String::from_utf8_lossy(exc.name()).into_owned(),
         }
     }
+}
+
+/// Converts handshake rejection into an error.
+///
+/// clickhouse-c leaves `err` empty for handshake rejection and transfers
+/// exception ownership instead.
+pub(crate) fn take_handshake_exception(
+    exc: *mut sys::chc_exception,
+    alloc: Allocator,
+) -> Option<Error> {
+    // SAFETY: handshake transferred ownership of exception allocated by alloc
+    NonNull::new(exc).map(|p| unsafe { Exception::from_raw(p, alloc) }.into())
 }
 
 fn cstr_bytes<'a>(ptr: *mut c_char, len: usize) -> &'a [u8] {

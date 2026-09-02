@@ -55,8 +55,10 @@ pub enum Kind {
     Interval = sys::CHC_INTERVAL,
     Point = sys::CHC_POINT,
     Ring = sys::CHC_RING,
+    LineString = sys::CHC_LINE_STRING,
     Polygon = sys::CHC_POLYGON,
     MultiPolygon = sys::CHC_MULTI_POLYGON,
+    MultiLineString = sys::CHC_MULTI_LINE_STRING,
     Variant = sys::CHC_VARIANT,
     Dynamic = sys::CHC_DYNAMIC,
     Json = sys::CHC_JSON,
@@ -114,8 +116,10 @@ impl Kind {
             sys::CHC_INTERVAL => Self::Interval,
             sys::CHC_POINT => Self::Point,
             sys::CHC_RING => Self::Ring,
+            sys::CHC_LINE_STRING => Self::LineString,
             sys::CHC_POLYGON => Self::Polygon,
             sys::CHC_MULTI_POLYGON => Self::MultiPolygon,
+            sys::CHC_MULTI_LINE_STRING => Self::MultiLineString,
             sys::CHC_VARIANT => Self::Variant,
             sys::CHC_DYNAMIC => Self::Dynamic,
             sys::CHC_JSON => Self::Json,
@@ -124,6 +128,47 @@ impl Kind {
             sys::CHC_SIMPLE_AGGREGATE_FUNCTION => Self::SimpleAggregateFunction,
             sys::CHC_NOTHING => Self::Nothing,
             sys::CHC_QBIT => Self::QBit,
+            _ => return None,
+        })
+    }
+}
+
+/// Unit of an `Interval` type.
+///
+/// Every `Interval*` type parses to [`Kind::Interval`]; unit is metadata on
+/// type, reported by [`TypeRef::interval_unit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum IntervalUnit {
+    Nanosecond = sys::CHC_INTERVAL_NANOSECOND,
+    Microsecond = sys::CHC_INTERVAL_MICROSECOND,
+    Millisecond = sys::CHC_INTERVAL_MILLISECOND,
+    Second = sys::CHC_INTERVAL_SECOND,
+    Minute = sys::CHC_INTERVAL_MINUTE,
+    Hour = sys::CHC_INTERVAL_HOUR,
+    Day = sys::CHC_INTERVAL_DAY,
+    Week = sys::CHC_INTERVAL_WEEK,
+    Month = sys::CHC_INTERVAL_MONTH,
+    Quarter = sys::CHC_INTERVAL_QUARTER,
+    Year = sys::CHC_INTERVAL_YEAR,
+}
+
+impl IntervalUnit {
+    /// Returns None for `CHC_INTERVAL_NONE` and for units added to C API but
+    /// not represented here.
+    pub(crate) fn from_raw(u: sys::chc_interval_unit) -> Option<Self> {
+        Some(match u {
+            sys::CHC_INTERVAL_NANOSECOND => Self::Nanosecond,
+            sys::CHC_INTERVAL_MICROSECOND => Self::Microsecond,
+            sys::CHC_INTERVAL_MILLISECOND => Self::Millisecond,
+            sys::CHC_INTERVAL_SECOND => Self::Second,
+            sys::CHC_INTERVAL_MINUTE => Self::Minute,
+            sys::CHC_INTERVAL_HOUR => Self::Hour,
+            sys::CHC_INTERVAL_DAY => Self::Day,
+            sys::CHC_INTERVAL_WEEK => Self::Week,
+            sys::CHC_INTERVAL_MONTH => Self::Month,
+            sys::CHC_INTERVAL_QUARTER => Self::Quarter,
+            sys::CHC_INTERVAL_YEAR => Self::Year,
             _ => return None,
         })
     }
@@ -234,6 +279,11 @@ impl<'a> TypeRef<'a> {
         unsafe { sys::chc_type_datetime64_scale(self.raw) }
     }
 
+    /// Returns unit for an `Interval*` type, or None for other types.
+    pub fn interval_unit(&self) -> Option<IntervalUnit> {
+        IntervalUnit::from_raw(unsafe { sys::chc_type_interval_unit(self.raw) })
+    }
+
     /// Returns `N` for `QBit(T, N)`, or zero for other types.
     ///
     /// A QBit column uses [`ColumnLayout::Tuple`] with one fixed column per
@@ -334,7 +384,7 @@ impl<'a> TypeRef<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, TypeAst};
+    use super::{IntervalUnit, Kind, TypeAst};
     use crate::Allocator;
 
     fn parse(name: &str) -> TypeAst {
@@ -357,6 +407,27 @@ mod tests {
         let ty = parse("Array(UInt32)");
         assert_eq!(ty.view().qbit_dimension(), 0);
         assert_eq!(ty.view().qbit_element_size(), 0);
+    }
+
+    #[test]
+    fn interval_names_carry_their_unit() {
+        let ty = parse("IntervalQuarter");
+        assert_eq!(ty.view().kind(), Some(Kind::Interval));
+        assert_eq!(ty.view().interval_unit(), Some(IntervalUnit::Quarter));
+
+        let nested = parse("Nullable(IntervalDay)");
+        let inner = nested.view().child(0).expect("Nullable child");
+        assert_eq!(inner.interval_unit(), Some(IntervalUnit::Day));
+        assert_eq!(nested.view().interval_unit(), None);
+    }
+
+    #[test]
+    fn line_string_kinds_parse() {
+        assert_eq!(parse("LineString").view().kind(), Some(Kind::LineString));
+        assert_eq!(
+            parse("MultiLineString").view().kind(),
+            Some(Kind::MultiLineString)
+        );
     }
 
     // Unknown C discriminants must not convert to adjacent Rust variants

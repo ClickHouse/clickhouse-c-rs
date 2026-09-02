@@ -289,7 +289,6 @@ unsafe extern "C" fn slice_write(
     if !err.is_null() {
         // SAFETY: caller supplies writable error slot
         let e = unsafe { &mut *err };
-        e.server_code = 0;
         let n = MSG.len().min(e.msg.len() - 1);
         for (slot, b) in e.msg.iter_mut().zip(&MSG[..n]) {
             *slot = *b as core::ffi::c_char;

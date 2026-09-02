@@ -11,7 +11,7 @@ use std::ffi::c_char;
 
 use crate::alloc::Allocator;
 use crate::builder::BlockBuilder;
-use crate::client::{ClientOpts, Event, ServerInfo};
+use crate::client::{ClientOpts, Event, ServerInfo, take_handshake_exception};
 use crate::codec::Codec;
 use crate::error::{Result, check};
 use crate::sys;
@@ -145,9 +145,17 @@ impl IolessClient {
 
     /// Advances Hello exchange. Repeat after sending output and submitting
     /// input until method returns [`Step::Ready`].
+    ///
+    /// Server rejection returns
+    /// [`ErrorKind::Server`](crate::ErrorKind::Server) carrying exception
+    /// code, class, and untruncated message.
     pub fn handshake(&mut self) -> Result<Step<()>> {
+        let mut exc: *mut sys::chc_exception = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
-        let rc = unsafe { sys::chc_async_handshake(self.raw.as_ptr(), &mut err) };
+        let rc = unsafe { sys::chc_async_handshake(self.raw.as_ptr(), &mut exc, &mut err) };
+        if let Some(e) = take_handshake_exception(exc, *self.alloc) {
+            return Err(e);
+        }
         step(rc, &err).map(|s| s.map_ready(|()| ()))
     }
 

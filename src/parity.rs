@@ -6,7 +6,7 @@
 
 use crate::block::ColumnLayout;
 use crate::client::PacketKind;
-use crate::types::Kind;
+use crate::types::{IntervalUnit, Kind};
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/parity.rs"));
@@ -85,6 +85,21 @@ fn every_type_kind_maps_to_a_variant() {
             Kind::from_raw(value as _).is_some(),
             "clickhouse-c added {name} to chc_kind; Kind has no variant for it, \
              so parsed types of that kind report None"
+        );
+    }
+}
+
+#[test]
+fn every_interval_unit_maps_to_a_variant() {
+    for (name, value) in enumerators("chc_interval_unit") {
+        // Zero marks a type without an interval unit
+        if value == 0 {
+            continue;
+        }
+        assert!(
+            IntervalUnit::from_raw(value as _).is_some(),
+            "clickhouse-c added {name} to chc_interval_unit; IntervalUnit has no \
+             variant for it, so Interval types of that unit report None"
         );
     }
 }

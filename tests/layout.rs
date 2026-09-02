@@ -10,9 +10,7 @@ use clickhouse_c::sys;
 unsafe extern "C" {
     fn chc_rs_size_chc_err() -> usize;
     fn chc_rs_align_chc_err() -> usize;
-    fn chc_rs_off_chc_err__server_code() -> usize;
     fn chc_rs_off_chc_err__msg() -> usize;
-    fn chc_rs_off_chc_err__server_name() -> usize;
 
     fn chc_rs_size_chc_alloc() -> usize;
     fn chc_rs_align_chc_alloc() -> usize;
@@ -174,9 +172,7 @@ macro_rules! field {
 #[test]
 fn chc_err_matches_c() {
     layout!(sys::chc_err, chc_rs_size_chc_err, chc_rs_align_chc_err);
-    field!(sys::chc_err, server_code, chc_rs_off_chc_err__server_code);
     field!(sys::chc_err, msg, chc_rs_off_chc_err__msg);
-    field!(sys::chc_err, server_name, chc_rs_off_chc_err__server_name);
 }
 
 #[test]

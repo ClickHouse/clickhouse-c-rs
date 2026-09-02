@@ -74,4 +74,4 @@ pub use error::{Error, ErrorKind, Result};
 pub use io::{CancelToken, Io, PosixIo, SliceIo};
 pub use ioless::{IolessClient, Step};
 pub use query::{QueryOpts, QueryParam, QuerySetting};
-pub use types::{Kind, TypeAst, TypeRef};
+pub use types::{IntervalUnit, Kind, TypeAst, TypeRef};

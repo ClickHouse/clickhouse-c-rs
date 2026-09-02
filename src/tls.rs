@@ -158,7 +158,6 @@ unsafe extern "C" fn tls_write(
 unsafe fn set_err(err: *mut sys::chc_err, code: c_int, msg: &str) -> c_int {
     if !err.is_null() {
         let e = unsafe { &mut *err };
-        e.server_code = 0;
         let cap = e.msg.len();
         if cap > 0 {
             let n = msg.len().min(cap - 1);

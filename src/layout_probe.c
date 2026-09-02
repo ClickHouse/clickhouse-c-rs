@@ -16,9 +16,7 @@
 
 /* clickhouse.h */
 CHC_RS_LAYOUT(chc_err)
-CHC_RS_FIELD(chc_err, server_code)
 CHC_RS_FIELD(chc_err, msg)
-CHC_RS_FIELD(chc_err, server_name)
 
 CHC_RS_LAYOUT(chc_alloc)
 CHC_RS_FIELD(chc_alloc, ud)

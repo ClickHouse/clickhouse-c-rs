@@ -146,6 +146,13 @@ fn generate_constants(chc_dir: &Path, out_dir: &Path) {
         "chc_col_kind",
         "clickhouse.h",
     );
+    emit_named(
+        &mut out,
+        &core_enums,
+        "chc_interval_unit",
+        "chc_interval_unit",
+        "clickhouse.h",
+    );
 
     let comp_enums = extract_enums(&comp_src);
     emit_named(
