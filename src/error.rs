@@ -19,8 +19,9 @@ pub enum ErrorKind {
     Oom,
     /// [`CancelToken`](crate::CancelToken) was set before a read.
     Cancelled,
-    /// Server returned an exception. See [`Error::server_code`] and
-    /// [`Error::server_name`] for details.
+    /// Server rejected handshake with an exception. See
+    /// [`Error::server_code`] and [`Error::server_name`] for details. Query
+    /// exceptions arrive as [`Event::Exception`](crate::Event::Exception).
     Server,
     /// API input was invalid.
     Usage,
@@ -72,12 +73,7 @@ impl Error {
     }
 
     pub(crate) fn from_raw(code: c_int, e: &sys::chc_err) -> Self {
-        Self {
-            kind: ErrorKind::from_code(code),
-            server_code: e.server_code,
-            message: cstr_array_to_string(&e.msg),
-            server_name: cstr_array_to_string(&e.server_name),
-        }
+        Self::new(ErrorKind::from_code(code), cstr_array_to_string(&e.msg))
     }
 }
 

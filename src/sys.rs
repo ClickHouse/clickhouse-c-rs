@@ -14,11 +14,9 @@ use core::ffi::{c_char, c_int, c_void};
 
 pub type chc_kind = c_int;
 pub type chc_col_kind = c_int;
+pub type chc_interval_unit = c_int;
 pub type chc_compression = c_int;
 pub type chc_packet_kind = c_int;
-
-// Header uses literal rather than named macro
-pub const CHC_ERR_NAME_LEN: usize = 64;
 
 include!(concat!(env!("OUT_DIR"), "/sys_constants.rs"));
 
@@ -26,17 +24,13 @@ include!(concat!(env!("OUT_DIR"), "/sys_constants.rs"));
 
 #[repr(C)]
 pub struct chc_err {
-    pub server_code: c_int,
     pub msg: [c_char; CHC_ERR_MSG_LEN],
-    pub server_name: [c_char; CHC_ERR_NAME_LEN],
 }
 
 impl chc_err {
     pub const fn zeroed() -> Self {
         Self {
-            server_code: 0,
             msg: [0; CHC_ERR_MSG_LEN],
-            server_name: [0; CHC_ERR_NAME_LEN],
         }
     }
 }
@@ -172,6 +166,7 @@ unsafe extern "C" {
     pub fn chc_type_decimal_precision(t: *const chc_type) -> c_int;
     pub fn chc_type_decimal_scale(t: *const chc_type) -> c_int;
     pub fn chc_type_datetime64_scale(t: *const chc_type) -> c_int;
+    pub fn chc_type_interval_unit(t: *const chc_type) -> chc_interval_unit;
     pub fn chc_type_qbit_dimension(t: *const chc_type) -> usize;
     pub fn chc_type_qbit_element_size(t: *const chc_type) -> usize;
     pub fn chc_type_timezone(t: *const chc_type, out_len: *mut usize) -> *const c_char;
@@ -625,11 +620,13 @@ pub struct chc_query_opts {
 }
 
 unsafe extern "C" {
+    // Handshake rejection transfers exception ownership through `exc`
     pub fn chc_client_init(
         out: *mut *mut chc_client,
         opts: *const chc_client_opts,
         al: *const chc_alloc,
         io: *mut chc_io,
+        exc: *mut *mut chc_exception,
         err: *mut chc_err,
     ) -> c_int;
     pub fn chc_client_close(c: *mut chc_client);
@@ -690,7 +687,12 @@ unsafe extern "C" {
     pub fn chc_async_pending_out(c: *mut chc_async_client, buf: *mut *const u8, len: *mut usize);
     pub fn chc_async_consume_out(c: *mut chc_async_client, n: usize);
 
-    pub fn chc_async_handshake(c: *mut chc_async_client, err: *mut chc_err) -> c_int;
+    // Handshake rejection transfers exception ownership through `exc`
+    pub fn chc_async_handshake(
+        c: *mut chc_async_client,
+        exc: *mut *mut chc_exception,
+        err: *mut chc_err,
+    ) -> c_int;
     pub fn chc_async_send_query(
         c: *mut chc_async_client,
         sql: *const c_char,

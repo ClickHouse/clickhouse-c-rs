@@ -168,8 +168,9 @@ the server unquotes, then parses the text as that type. So `{n:UInt8}` takes
 
 Server-side query errors are not `Err`. They arrive as `Event::Exception`,
 carrying the server's `code`, `display_text`, and `stack_trace`; `Err` is
-reserved for transport, protocol, and decode failures. `Exception` converts
-into the crate's `Error` with `.into()`, as above.
+reserved for transport, protocol, and decode failures, and for a handshake the
+server rejects. `Exception` converts into the crate's `Error` with `.into()`,
+as above.
 
 The first `Event::Data` of a result is a header block describing the schema
 with zero rows; data blocks follow.
@@ -610,8 +611,10 @@ every object parsed through it — hence `&'static`.
 
 ## Errors and server exceptions {#errors}
 
-`Error` carries an `ErrorKind`, a message copied out of the C `chc_err` buffer,
-and, for a server exception, the ClickHouse error code and exception class.
+`Error` carries an `ErrorKind` and a message. Transport, protocol, and decode
+failures copy the message out of the fixed-size C `chc_err` buffer. A handshake
+rejection carries the server exception instead, so its untruncated message, the
+ClickHouse error code, and the exception class all survive.
 
 | Kind | Meaning |
 |---|---|
@@ -621,7 +624,7 @@ and, for a server exception, the ClickHouse error code and exception class.
 | `Type` | a type name did not parse, or a column did not match its type |
 | `Oom` | the allocator returned null |
 | `Cancelled` | a `CancelToken` was set before this read |
-| `Server` | the server sent an exception |
+| `Server` | the server rejected the handshake with an exception |
 | `Usage` | the caller broke an API contract |
 | `WouldBlock` | the ioless client needs more submitted bytes |
 
@@ -643,9 +646,9 @@ The block reader decodes:
 - `Enum8`, `Enum16`
 - `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`, `Nested(...)`
 - `LowCardinality(T)`
-- `Interval`
+- `Interval*`, with unit from `TypeRef::interval_unit`
 - `QBit(T, N)`, as a tuple of `N`-bit-wide bit-plane columns, MSB plane first
-- `Point`, `Ring`, `Polygon`, `MultiPolygon`
+- `Point`, `Ring`, `LineString`, `Polygon`, `MultiPolygon`, `MultiLineString`
 - `SimpleAggregateFunction(f, T)`, which decodes as its inner `T`
 - `JSON` and `Object('json')`, as `String` columns under string serialization
 
@@ -659,8 +662,8 @@ shape back.
 
 Type metadata is available without decoding a block: `TypeAst::parse` parses a
 type name, and `TypeRef` exposes the kind, children, tuple field names, enum
-entries, decimal precision and scale, `DateTime64` scale, timezone, and QBit
-dimension.
+entries, decimal precision and scale, `DateTime64` scale, `Interval` unit,
+timezone, and QBit dimension.
 
 ## Raw FFI {#raw-ffi}
 
