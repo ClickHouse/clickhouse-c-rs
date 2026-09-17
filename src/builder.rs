@@ -299,11 +299,9 @@ fn validate_offsets(offsets: &[u64], n_rows: usize, label: &str) -> Result<usize
         }
         previous = end;
     }
-    usize::try_from(previous).map_err(|_| {
-        usage(format!(
-            "{label} final offset does not fit usize: {previous}"
-        ))
-    })
+    // On a 32-bit target an offset past usize cannot be covered by any slab,
+    // so saturate and let the length check reject it
+    Ok(usize::try_from(previous).unwrap_or(usize::MAX))
 }
 
 fn validate_string(offsets: &[u64], data_len: usize, n_rows: usize, label: &str) -> Result<()> {
@@ -317,27 +315,25 @@ fn validate_low_cardinality_keys(
     n_rows: usize,
     dict_n: usize,
 ) -> Result<()> {
-    let key_size = match key_size {
-        1 | 2 | 4 | 8 => key_size as usize,
+    let read: fn(&[u8]) -> u64 = match key_size {
+        1 => |key| u64::from(key[0]),
+        2 => |key| u64::from(u16::from_ne_bytes(key.try_into().expect("key width"))),
+        4 => |key| u64::from(u32::from_ne_bytes(key.try_into().expect("key width"))),
+        8 => |key| u64::from_ne_bytes(key.try_into().expect("key width")),
         _ => {
             return Err(usage(format!(
                 "LowCardinality key size must be 1, 2, 4, or 8, got {key_size}"
             )));
         }
     };
+    let key_size = key_size as usize;
     require_len(
         "LowCardinality keys",
         keys.len(),
         checked_len(n_rows, key_size, "LowCardinality keys")?,
     )?;
     for (row, key) in keys.chunks_exact(key_size).enumerate() {
-        let value = match key_size {
-            1 => u64::from(key[0]),
-            2 => u64::from(u16::from_ne_bytes(key.try_into().expect("key width"))),
-            4 => u64::from(u32::from_ne_bytes(key.try_into().expect("key width"))),
-            8 => u64::from_ne_bytes(key.try_into().expect("key width")),
-            _ => unreachable!(),
-        };
+        let value = read(key);
         if value >= dict_n as u64 {
             return Err(usage(format!(
                 "LowCardinality key out of range at row {row}: {value} >= {dict_n}"
@@ -354,3 +350,154 @@ unsafe impl Sync for ColumnBuilder<'_> {}
 unsafe impl Send for BlockBuilder<'_> {}
 // Shared references only permit read operations, including asynchronous send
 unsafe impl Sync for BlockBuilder<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockBuilder, ColumnBuilder};
+    use crate::sys;
+    use crate::{Allocator, ErrorKind, TypeAst};
+
+    fn kind(result: crate::Result<ColumnBuilder<'_>>) -> ErrorKind {
+        result.err().expect("invalid column accepted").kind
+    }
+
+    #[test]
+    fn a_zero_width_element_is_a_usage_error() {
+        assert_eq!(kind(ColumnBuilder::fixed(&[0; 4], 0, 1)), ErrorKind::Usage);
+    }
+
+    // A corrupt row count must not wrap into a short length that passes
+    #[test]
+    fn row_count_times_width_must_not_overflow() {
+        assert_eq!(
+            kind(ColumnBuilder::fixed(&[0; 4], usize::MAX, 2)),
+            ErrorKind::Usage,
+        );
+    }
+
+    #[test]
+    fn a_tuple_needs_children_and_matching_scratch() {
+        let mut ptrs: [*mut sys::chc_column; 1] = [core::ptr::null_mut()];
+        assert_eq!(kind(ColumnBuilder::tuple(&[], &mut ptrs)), ErrorKind::Usage);
+
+        let one = ColumnBuilder::fixed(&[0; 4], 4, 1).expect("fixed");
+        let two = ColumnBuilder::fixed(&[0; 8], 4, 2).expect("fixed");
+        assert_eq!(
+            kind(ColumnBuilder::tuple(&[one, two], &mut ptrs)),
+            ErrorKind::Usage,
+        );
+    }
+
+    #[test]
+    fn tuple_children_must_agree_on_row_count() {
+        let one = ColumnBuilder::fixed(&[0; 4], 4, 1).expect("fixed");
+        let two = ColumnBuilder::fixed(&[0; 8], 4, 2).expect("fixed");
+        let mut ptrs: [*mut sys::chc_column; 2] = [core::ptr::null_mut(); 2];
+        assert_eq!(
+            kind(ColumnBuilder::tuple(&[one, two], &mut ptrs)),
+            ErrorKind::Usage,
+        );
+    }
+
+    #[test]
+    fn low_cardinality_keys_must_use_a_wire_width() {
+        let dict = ColumnBuilder::string(&[0], &[], 1).expect("dict");
+        for bad in [0, 3, 16, -1] {
+            assert_eq!(
+                kind(dict.low_cardinality(bad, &[0; 8], 1)),
+                ErrorKind::Usage,
+                "key size {bad}",
+            );
+        }
+    }
+
+    #[test]
+    fn every_key_width_indexes_the_dictionary() {
+        let offsets = [1u64, 2];
+        let dict = ColumnBuilder::string(&offsets, b"ab", 2).expect("dict");
+        for (key_size, keys) in [
+            (1, vec![1u8]),
+            (2, 1u16.to_ne_bytes().to_vec()),
+            (4, 1u32.to_ne_bytes().to_vec()),
+            (8, 1u64.to_ne_bytes().to_vec()),
+        ] {
+            dict.low_cardinality(key_size, &keys, 1)
+                .unwrap_or_else(|e| panic!("key size {key_size}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_key_past_the_dictionary_is_rejected() {
+        let offsets = [1u64];
+        let dict = ColumnBuilder::string(&offsets, b"a", 1).expect("dict");
+        for (key_size, keys) in [
+            (1, vec![9u8]),
+            (2, 9u16.to_ne_bytes().to_vec()),
+            (4, 9u32.to_ne_bytes().to_vec()),
+            (8, 9u64.to_ne_bytes().to_vec()),
+        ] {
+            assert_eq!(
+                kind(dict.low_cardinality(key_size, &keys, 1)),
+                ErrorKind::Usage,
+                "key size {key_size}",
+            );
+        }
+    }
+
+    #[test]
+    fn key_slab_length_must_match_the_row_count() {
+        let offsets = [1u64];
+        let dict = ColumnBuilder::string(&offsets, b"a", 1).expect("dict");
+        assert_eq!(kind(dict.low_cardinality(4, &[0; 4], 2)), ErrorKind::Usage,);
+        assert_eq!(
+            kind(dict.low_cardinality(4, &[0; 4], usize::MAX)),
+            ErrorKind::Usage,
+        );
+    }
+
+    #[test]
+    fn offsets_must_not_move_backwards() {
+        let offsets = [2u64, 1];
+        assert_eq!(
+            kind(ColumnBuilder::string(&offsets, b"ab", 2)),
+            ErrorKind::Usage,
+        );
+        let values = ColumnBuilder::fixed(&[0; 8], 4, 2).expect("fixed");
+        assert_eq!(kind(values.array(&offsets, 2)), ErrorKind::Usage);
+    }
+
+    // An offset past the slab would index outside borrowed data
+    #[test]
+    fn offsets_must_stay_inside_their_slab() {
+        let offsets = [u64::MAX];
+        assert_eq!(
+            kind(ColumnBuilder::string(&offsets, b"a", 1)),
+            ErrorKind::Usage,
+        );
+    }
+
+    #[test]
+    fn a_null_map_must_cover_every_row() {
+        let values = ColumnBuilder::fixed(&[0; 8], 4, 2).expect("fixed");
+        assert_eq!(kind(values.nullable(&[0])), ErrorKind::Usage);
+    }
+
+    #[test]
+    fn array_values_must_match_the_final_offset() {
+        let values = ColumnBuilder::fixed(&[0; 8], 4, 2).expect("fixed");
+        assert_eq!(kind(values.array(&[3], 1)), ErrorKind::Usage);
+    }
+
+    #[test]
+    fn a_default_block_holds_no_columns() {
+        let alloc = Allocator::stdlib();
+        let ty = TypeAst::parse("UInt32", alloc).expect("UInt32");
+        let data = 1u32.to_le_bytes();
+        let col = ColumnBuilder::fixed(&data, 4, 1).expect("fixed");
+        let mut bb = BlockBuilder::default();
+        bb.append("x", ty.view(), &col).expect("append");
+        let raw = unsafe { &*bb.as_ptr() };
+        assert_eq!(raw.n_cols, 1);
+        assert_eq!(raw.n_rows, 1);
+    }
+}

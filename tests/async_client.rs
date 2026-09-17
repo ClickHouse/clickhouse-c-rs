@@ -4,11 +4,16 @@
 
 mod common;
 
+use core::pin::Pin;
+use core::task::{Context, Poll};
+use std::io;
+
 use clickhouse_c::{
     AsyncClient, AsyncTransport, Block, BlockBuilder, BoxedAsyncClient, ClientOpts, ColumnBuilder,
-    Event, TypeAst,
+    ErrorKind, Event, TypeAst,
 };
 use common::{ChServer, TestResult, clickhouse_on_path};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 async fn connect(server: &ChServer) -> clickhouse_c::Result<AsyncClient> {
     AsyncClient::connect(("127.0.0.1", server.tcp_port), ClientOpts::new(), None).await
@@ -175,4 +180,142 @@ fn collect_rows(block: &Block, rows: &mut Vec<(i32, String)>) {
             String::from_utf8(name_data[name_start..name_end].to_vec()).unwrap(),
         ));
     }
+}
+
+/// Transport that accepts every write and reports EOF on the first read.
+struct ClosedReader;
+
+impl AsyncRead for ClosedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for ClosedReader {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Transport that never accepts a byte.
+struct StalledWriter;
+
+impl AsyncRead for StalledWriter {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for StalledWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(0))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A peer that closes before answering Hello must surface as EOF rather than
+/// as an endless pump.
+#[tokio::test(flavor = "current_thread")]
+async fn a_closed_transport_ends_the_handshake() {
+    let Err(err) = AsyncClient::handshake_on(ClosedReader, ClientOpts::new(), None).await else {
+        panic!("handshake completed without a server");
+    };
+    assert_eq!(err.kind, ErrorKind::Eof);
+}
+
+/// A transport that accepts no bytes must fail instead of spinning on an
+/// output queue that never drains.
+#[tokio::test(flavor = "current_thread")]
+async fn a_transport_that_writes_nothing_is_an_error() {
+    let Err(err) = AsyncClient::handshake_on(StalledWriter, ClientOpts::new(), None).await else {
+        panic!("handshake completed without a server");
+    };
+    assert_eq!(err.kind, ErrorKind::Io);
+    assert!(err.message.contains("write returned zero"), "{err}");
+}
+
+/// Read buffer size comes from client options when set.
+#[tokio::test(flavor = "current_thread")]
+async fn a_custom_read_buffer_size_is_honoured() -> TestResult {
+    if !clickhouse_on_path() {
+        eprintln!("clickhouse binary not found, skipping");
+        return Ok(());
+    }
+
+    let server = ChServer::spawn()?;
+    let mut opts = ClientOpts::new();
+    opts.read_buffer_bytes = 64;
+    let mut client = AsyncClient::connect(("127.0.0.1", server.tcp_port), opts, None).await?;
+
+    // Small buffer forces several reads for one result
+    client
+        .send_query("SELECT number FROM numbers(4096)", None)
+        .await?;
+    drain(&mut client).await?;
+    Ok(())
+}
+
+/// Transport-independent core stays reachable for callers that drive their own
+/// I/O over an established connection.
+#[tokio::test(flavor = "current_thread")]
+async fn the_protocol_core_is_reachable() -> TestResult {
+    if !clickhouse_on_path() {
+        eprintln!("clickhouse binary not found, skipping");
+        return Ok(());
+    }
+
+    let server = ChServer::spawn()?;
+    let mut client = connect(&server).await?;
+    assert!(client.core().pending_out().is_empty());
+    assert!(client.core().server_info().is_some());
+    Ok(())
+}
+
+// Multi-thread Tokio requires method futures to implement Send
+#[allow(dead_code)]
+fn method_futures_are_send(mut c: AsyncClient, bb: BlockBuilder<'static>) {
+    fn require_send<T: Send>(_: T) {}
+    require_send(AsyncClient::connect(("h", 1u16), ClientOpts::new(), None));
+    require_send(c.send_query("", None));
+    require_send(c.send_data(Some(&bb)));
+    require_send(c.send_data_end());
+    require_send(c.recv_event());
+}
+
+// Custom Tokio transports use same protocol adapter
+#[allow(dead_code)]
+fn any_tokio_transport_works(pipe: tokio::io::DuplexStream) {
+    fn require_send<T: Send>(_: T) {}
+    require_send(AsyncClient::handshake_on(pipe, ClientOpts::new(), None));
 }

@@ -106,22 +106,56 @@ mod vtable {
 #[cfg(test)]
 mod tests {
     use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::c_void;
     use core::sync::atomic::{AtomicBool, Ordering};
     use std::alloc::System;
     use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::Mutex;
 
     use super::Allocator;
+    use crate::sys;
     use crate::{BlockBuilder, ColumnBuilder, TypeAst};
 
-    static CHECKED: LazyLock<CheckedAlloc> = LazyLock::new(|| CheckedAlloc {
-        live: Mutex::new(HashMap::new()),
-        invalid_layout: AtomicBool::new(false),
-    });
-
+    /// Allocator that records every live block and the layout it was given.
     struct CheckedAlloc {
         live: Mutex<HashMap<usize, Layout>>,
         invalid_layout: AtomicBool,
+    }
+
+    impl CheckedAlloc {
+        /// Leaked because [`Allocator::global`] stores the reference in C user
+        /// data. Each test owns its own instance, so a deliberate mismatch in
+        /// one cannot be read by another.
+        fn leaked() -> &'static Self {
+            Box::leak(Box::new(Self {
+                live: Mutex::new(HashMap::new()),
+                invalid_layout: AtomicBool::new(false),
+            }))
+        }
+
+        fn take(&self, ptr: *mut u8, layout: Layout) -> Option<Layout> {
+            let actual = self
+                .live
+                .lock()
+                .expect("checked allocator lock")
+                .remove(&(ptr as usize));
+            match actual {
+                Some(actual) if actual == layout => Some(actual),
+                Some(actual) => {
+                    self.invalid_layout.store(true, Ordering::Relaxed);
+                    Some(actual)
+                }
+                None => {
+                    self.invalid_layout.store(true, Ordering::Relaxed);
+                    None
+                }
+            }
+        }
+
+        fn is_clean(&self) -> bool {
+            !self.invalid_layout.load(Ordering::Relaxed)
+                && self.live.lock().expect("checked allocator lock").is_empty()
+        }
     }
 
     unsafe impl GlobalAlloc for CheckedAlloc {
@@ -137,34 +171,16 @@ mod tests {
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            let Some(actual) = self
-                .live
-                .lock()
-                .expect("checked allocator lock")
-                .remove(&(ptr as usize))
-            else {
-                self.invalid_layout.store(true, Ordering::Relaxed);
+            let Some(actual) = self.take(ptr, layout) else {
                 return;
             };
-            if actual != layout {
-                self.invalid_layout.store(true, Ordering::Relaxed);
-            }
             unsafe { System.dealloc(ptr, actual) };
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let Some(actual) = self
-                .live
-                .lock()
-                .expect("checked allocator lock")
-                .remove(&(ptr as usize))
-            else {
-                self.invalid_layout.store(true, Ordering::Relaxed);
+            let Some(actual) = self.take(ptr, layout) else {
                 return core::ptr::null_mut();
             };
-            if actual != layout {
-                self.invalid_layout.store(true, Ordering::Relaxed);
-            }
             let new_ptr = unsafe { System.realloc(ptr, actual, new_size) };
             let mut live = self.live.lock().expect("checked allocator lock");
             if new_ptr.is_null() {
@@ -177,19 +193,42 @@ mod tests {
         }
     }
 
+    fn ud(a: &'static CheckedAlloc) -> *mut c_void {
+        (a as *const CheckedAlloc).cast_mut().cast()
+    }
+
+    // C calls these through the table, so tests do too
+    fn call_alloc(raw: &sys::chc_alloc, ud: *mut c_void, bytes: usize) -> *mut c_void {
+        unsafe { raw.alloc.expect("alloc callback")(ud, bytes) }
+    }
+
+    fn call_realloc(
+        raw: &sys::chc_alloc,
+        ud: *mut c_void,
+        p: *mut c_void,
+        old_bytes: usize,
+        new_bytes: usize,
+    ) -> *mut c_void {
+        unsafe { raw.realloc.expect("realloc callback")(ud, p, old_bytes, new_bytes) }
+    }
+
+    fn call_free(raw: &sys::chc_alloc, ud: *mut c_void, p: *mut c_void, bytes: usize) {
+        unsafe { raw.free.expect("free callback")(ud, p, bytes) }
+    }
+
+    #[test]
+    fn default_allocator_serves_c_requests() {
+        let raw = Allocator::default().raw;
+        assert!(raw.ud.is_null());
+        let p = call_alloc(&raw, raw.ud, 32);
+        assert!(!p.is_null());
+        call_free(&raw, raw.ud, p, 32);
+    }
+
     #[test]
     fn global_allocator_preserves_layouts() {
-        CHECKED.invalid_layout.store(false, Ordering::Relaxed);
-        assert!(
-            CHECKED
-                .live
-                .lock()
-                .expect("checked allocator lock")
-                .is_empty()
-        );
-
-        let alloc = Allocator::global(&*CHECKED);
-        drop(BlockBuilder::new());
+        let checked = CheckedAlloc::leaked();
+        let alloc = Allocator::global(checked);
         let ty = TypeAst::parse("UInt32", alloc).expect("UInt32");
         let data = 7u32.to_le_bytes();
         let col = ColumnBuilder::fixed(&data, ty.view().elem_size(), 1).expect("fixed");
@@ -197,14 +236,110 @@ mod tests {
         builder.append("x", ty.view(), &col).expect("append");
         drop(builder);
         drop(ty);
+        assert!(checked.is_clean());
+    }
 
-        assert!(!CHECKED.invalid_layout.load(Ordering::Relaxed));
-        assert!(
-            CHECKED
-                .live
-                .lock()
-                .expect("checked allocator lock")
-                .is_empty()
-        );
+    // C reallocates its own buffers; wrapper must route growth and release
+    #[test]
+    fn realloc_grows_shrinks_and_releases() {
+        let checked = CheckedAlloc::leaked();
+        let raw = Allocator::global(checked).raw;
+        let ud = ud(checked);
+
+        let p = call_alloc(&raw, ud, 16);
+        assert!(!p.is_null());
+        let grown = call_realloc(&raw, ud, p, 16, 64);
+        assert!(!grown.is_null());
+        let shrunk = call_realloc(&raw, ud, grown, 64, 8);
+        assert!(!shrunk.is_null());
+        call_free(&raw, ud, shrunk, 8);
+        assert!(checked.is_clean());
+    }
+
+    // C may hand a null pointer to either wrapper
+    #[test]
+    fn null_pointer_reallocates_as_a_fresh_block() {
+        let checked = CheckedAlloc::leaked();
+        let raw = Allocator::global(checked).raw;
+        let ud = ud(checked);
+
+        let p = call_realloc(&raw, ud, core::ptr::null_mut(), 0, 32);
+        assert!(!p.is_null());
+        call_free(&raw, ud, p, 32);
+        call_free(&raw, ud, core::ptr::null_mut(), 32);
+        assert!(checked.is_clean());
+    }
+
+    // Zero-byte requests still need a nonzero layout, releasing frees instead
+    #[test]
+    fn zero_sized_requests_round_up_and_release() {
+        let checked = CheckedAlloc::leaked();
+        let raw = Allocator::global(checked).raw;
+        let ud = ud(checked);
+
+        let p = call_alloc(&raw, ud, 0);
+        assert!(!p.is_null());
+        assert!(call_realloc(&raw, ud, p, 1, 0).is_null());
+        assert!(checked.is_clean());
+    }
+
+    // A corrupt length field must reach the OOM path, not an invalid layout
+    #[test]
+    fn unrepresentable_length_returns_null() {
+        let checked = CheckedAlloc::leaked();
+        let raw = Allocator::global(checked).raw;
+        let ud = ud(checked);
+
+        assert!(call_alloc(&raw, ud, usize::MAX).is_null());
+        let p = call_alloc(&raw, ud, 16);
+        assert!(call_realloc(&raw, ud, p, usize::MAX, 16).is_null());
+        // Bogus length leaves the block alone rather than freeing it wrongly
+        call_free(&raw, ud, p, usize::MAX);
+        call_free(&raw, ud, p, 16);
+        assert!(checked.is_clean());
+    }
+
+    // Harness itself must notice a wrapper that loses a layout
+    #[test]
+    fn checked_allocator_reports_a_layout_mismatch() {
+        let checked = CheckedAlloc::leaked();
+        let layout = Layout::from_size_align(16, 16).expect("layout");
+        let p = unsafe { checked.alloc(layout) };
+        unsafe { checked.dealloc(p, Layout::from_size_align(8, 16).expect("layout")) };
+        assert!(!checked.is_clean());
+    }
+
+    #[test]
+    fn checked_allocator_reports_an_unknown_block() {
+        let checked = CheckedAlloc::leaked();
+        let layout = Layout::from_size_align(16, 16).expect("layout");
+        let mut stack = 0u128;
+        let stray = (&mut stack as *mut u128).cast::<u8>();
+        assert!(unsafe { checked.realloc(stray, layout, 32) }.is_null());
+        unsafe { checked.dealloc(stray, layout) };
+        assert!(!checked.is_clean());
+    }
+
+    // Failed growth must leave the original block registered
+    #[test]
+    fn failed_growth_keeps_the_original_block() {
+        let checked = CheckedAlloc::leaked();
+        let layout = Layout::from_size_align(16, 16).expect("layout");
+        let p = unsafe { checked.alloc(layout) };
+        // Large enough to fail, small enough to stay a valid layout
+        let unservable = isize::MAX as usize / 2;
+        assert!(unsafe { checked.realloc(p, layout, unservable) }.is_null());
+        unsafe { checked.dealloc(p, layout) };
+        assert!(checked.is_clean());
+    }
+
+    #[test]
+    fn stdlib_vtable_round_trips_through_c() {
+        let raw = Allocator::stdlib().raw;
+        let p = call_alloc(&raw, raw.ud, 8);
+        assert!(!p.is_null());
+        let grown = call_realloc(&raw, raw.ud, p, 8, 24);
+        assert!(!grown.is_null());
+        call_free(&raw, raw.ud, grown, 24);
     }
 }

@@ -640,3 +640,41 @@ fn chc_packet_matches_c() {
         assert_eq!(payload + rust_in_arm, c_abs, "chc_packet_profile.{name}");
     }
 }
+
+/// Every `zeroed` constructor must hand C a struct with no stale pointers,
+/// because callers pass these straight into the library.
+#[test]
+fn zeroed_constructors_clear_every_field() {
+    let err = sys::chc_err::zeroed();
+    assert!(err.msg.iter().all(|&b| b == 0));
+
+    let opts = sys::chc_block_opts::zeroed();
+    assert!(!opts.has_block_info);
+    assert!(!opts.has_custom_serialization);
+    assert_eq!(opts.read_buffer_bytes, 0);
+
+    let col = sys::chc_block_col::zeroed();
+    assert!(col.name.is_null());
+    assert_eq!(col.name_len, 0);
+    assert!(col.type_.is_null());
+    assert!(col.col.is_null());
+
+    let builder = sys::chc_block_builder::zeroed();
+    assert!(builder.cols.is_null());
+    assert_eq!(builder.n_cols, 0);
+    assert_eq!(builder.n_rows, 0);
+
+    let client = sys::chc_client_opts::zeroed();
+    assert!(client.client_name.is_null());
+    assert!(client.database.is_null());
+    assert!(client.user.is_null());
+    assert!(client.password.is_null());
+    assert!(client.codec.is_null());
+    assert_eq!(client.compression, sys::CHC_COMP_NONE);
+    assert_eq!(client.client_revision, 0);
+    assert_eq!(client.read_buffer_bytes, 0);
+
+    let packet = sys::chc_packet::zeroed();
+    assert_eq!(packet.kind, 0);
+    assert!(unsafe { packet.payload.block }.is_null());
+}

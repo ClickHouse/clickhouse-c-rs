@@ -221,11 +221,7 @@ impl IolessClient {
     /// [`Step::Ready`] to obtain server-provided information.
     pub fn server_info(&self) -> Option<ServerInfo> {
         let p = unsafe { sys::chc_async_server_info(self.raw.as_ptr().cast_const()) };
-        if p.is_null() {
-            None
-        } else {
-            Some(ServerInfo::from_raw(unsafe { &*p }))
-        }
+        (!p.is_null()).then(|| ServerInfo::from_raw(unsafe { &*p }))
     }
 }
 

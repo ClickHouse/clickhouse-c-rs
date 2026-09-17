@@ -271,11 +271,7 @@ impl<'fd> Client<'fd> {
     /// Returns server information received during handshake.
     pub fn server_info(&self) -> Option<ServerInfo> {
         let p = unsafe { sys::chc_client_server_info(self.raw.as_ptr().cast_const()) };
-        if p.is_null() {
-            None
-        } else {
-            Some(ServerInfo::from_raw(unsafe { &*p }))
-        }
+        (!p.is_null()).then(|| ServerInfo::from_raw(unsafe { &*p }))
     }
 
     /// Sets transport read timeout.
@@ -667,8 +663,13 @@ impl ProfileInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::ClientOpts;
-    use crate::{Compression, ErrorKind};
+    use std::ffi::CStr;
+
+    use core::ffi::c_char;
+
+    use super::{ClientOpts, Event, PacketKind, cstr_bytes};
+    use crate::sys;
+    use crate::{Allocator, Compression, ErrorKind};
 
     /// Compression always requires a codec, including builds without codecs
     #[test]
@@ -691,5 +692,137 @@ mod tests {
             .validate_codec(Some(codec.as_ref()))
             .expect_err("mismatched codec");
         assert_eq!(mismatch.kind, ErrorKind::Usage);
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn matching_codec_passes_validation() {
+        use crate::Codec;
+
+        let codec = Codec::lz4();
+        ClientOpts::new()
+            .compression(Compression::Lz4)
+            .validate_codec(Some(codec.as_ref()))
+            .expect("lz4 codec for lz4 compression");
+    }
+
+    // Hello fields reach C as null-terminated copies
+    #[test]
+    fn handshake_fields_reach_raw_opts() {
+        let opts = ClientOpts::new()
+            .client_name("probe")
+            .database("db")
+            .user("reader")
+            .password("secret")
+            .client_version(1, 2, 3)
+            .client_revision(54465);
+        let raw = opts.to_raw(None).expect("no interior NUL");
+        let field = |p: *const core::ffi::c_char| unsafe { CStr::from_ptr(p) }.to_owned();
+        let raw = unsafe { &*raw.as_ptr() };
+        assert_eq!(field(raw.client_name).to_bytes(), b"probe");
+        assert_eq!(field(raw.database).to_bytes(), b"db");
+        assert_eq!(field(raw.user).to_bytes(), b"reader");
+        assert_eq!(field(raw.password).to_bytes(), b"secret");
+        assert_eq!(
+            (
+                raw.client_version_major,
+                raw.client_version_minor,
+                raw.client_version_patch,
+            ),
+            (1, 2, 3),
+        );
+        assert_eq!(raw.client_revision, 54465);
+        assert!(raw.codec.is_null());
+    }
+
+    #[test]
+    fn default_opts_leave_every_string_null() {
+        let raw = ClientOpts::new().to_raw(None).expect("no strings");
+        let raw = unsafe { &*raw.as_ptr() };
+        assert!(raw.client_name.is_null());
+        assert!(raw.database.is_null());
+        assert!(raw.user.is_null());
+        assert!(raw.password.is_null());
+    }
+
+    // Packet kinds added to C API must not convert to an adjacent variant
+    #[test]
+    fn unknown_packet_kind_is_none() {
+        assert!(PacketKind::from_raw(i32::MAX).is_none());
+        assert!(PacketKind::from_raw(-1).is_none());
+    }
+
+    #[test]
+    fn unknown_packet_is_a_protocol_error() {
+        let mut raw = sys::chc_packet::zeroed();
+        raw.kind = i32::MAX;
+        let err = Event::from_raw(&mut raw, Allocator::stdlib())
+            .err()
+            .expect("unknown packet kind accepted");
+        assert_eq!(err.kind, ErrorKind::Protocol);
+        assert!(err.message.contains("unknown server packet"), "{err}");
+    }
+
+    // Every packet kind, with whether C hands over a payload pointer
+    const KINDS: [(sys::chc_packet_kind, bool); 11] = [
+        (sys::CHC_PKT_DATA, true),
+        (sys::CHC_PKT_TOTALS, true),
+        (sys::CHC_PKT_EXTREMES, true),
+        (sys::CHC_PKT_LOG, true),
+        (sys::CHC_PKT_PROFILE_EVENTS, true),
+        (sys::CHC_PKT_EXCEPTION, true),
+        (sys::CHC_PKT_PROGRESS, false),
+        (sys::CHC_PKT_PROFILE_INFO, false),
+        (sys::CHC_PKT_PONG, false),
+        (sys::CHC_PKT_END_OF_STREAM, false),
+        (sys::CHC_PKT_TABLE_COLUMNS, false),
+    ];
+
+    // A payload-carrying kind whose payload C left null must not convert, and
+    // every other kind must convert to its own variant
+    #[test]
+    fn each_packet_kind_converts_to_its_variant() {
+        for (kind, carries_payload) in KINDS {
+            let mut raw = sys::chc_packet::zeroed();
+            raw.kind = kind;
+            let event = Event::from_raw(&mut raw, Allocator::stdlib());
+            assert_eq!(
+                matches!(&event, Err(err) if err.kind == ErrorKind::Protocol),
+                carries_payload,
+                "kind {kind}",
+            );
+            assert_eq!(matches!(event, Ok(Event::Pong)), kind == sys::CHC_PKT_PONG);
+            assert_eq!(
+                matches!(event, Ok(Event::EndOfStream)),
+                kind == sys::CHC_PKT_END_OF_STREAM,
+            );
+            assert_eq!(
+                matches!(event, Ok(Event::TableColumns)),
+                kind == sys::CHC_PKT_TABLE_COLUMNS,
+            );
+            assert_eq!(
+                matches!(event, Ok(Event::Progress(_))),
+                kind == sys::CHC_PKT_PROGRESS,
+            );
+            assert_eq!(
+                matches!(event, Ok(Event::ProfileInfo(_))),
+                kind == sys::CHC_PKT_PROFILE_INFO,
+            );
+        }
+    }
+
+    #[test]
+    fn every_c_packet_kind_has_a_variant() {
+        for (kind, _) in KINDS {
+            assert!(PacketKind::from_raw(kind).is_some(), "kind {kind}");
+        }
+    }
+
+    // Exception fields C left empty must not produce a slice over null
+    #[test]
+    fn empty_exception_fields_read_as_empty_slices() {
+        assert!(cstr_bytes(core::ptr::null_mut(), 7).is_empty());
+        let mut byte = b'x' as c_char;
+        assert!(cstr_bytes(&mut byte, 0).is_empty());
     }
 }
