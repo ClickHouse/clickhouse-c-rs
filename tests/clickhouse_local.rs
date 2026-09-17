@@ -173,6 +173,151 @@ fn write_then_read_back_tuple() {
     assert_eq!(b_out, ["x", "yy", "zzz"]);
 }
 
+/// Verifies `SimpleAggregateFunction` decodes as its storage type.
+#[test]
+fn read_simple_aggregate_function() {
+    if !clickhouse_on_path() {
+        eprintln!("clickhouse binary not found, skipping");
+        return;
+    }
+
+    let alloc = Allocator::stdlib();
+    let mut child = Command::new("clickhouse")
+        .args([
+            "local",
+            "--format",
+            "Native",
+            "--output_format_native_encode_types_in_binary_format=0",
+            "-q",
+            "SELECT CAST(7, 'SimpleAggregateFunction(sum, UInt64)') AS s",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn clickhouse local");
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut read_io = PosixIo::new(stdout.as_fd());
+    let mut reader =
+        BlockReader::new(read_io.as_mut(), alloc, BlockOpts::default()).expect("reader");
+
+    let block = reader.read().expect("read block").expect("one block");
+    let col_ty = block.column_type(0).expect("column type");
+    assert_eq!(col_ty.kind(), Some(Kind::SimpleAggregateFunction));
+    assert_eq!(col_ty.agg_function(), Some(&b"sum"[..]));
+    assert_eq!(col_ty.n_children(), 1);
+    assert_eq!(col_ty.child(0).and_then(|c| c.kind()), Some(Kind::UInt64));
+
+    let (elem_size, bytes) = block
+        .column(0)
+        .and_then(|c| c.fixed())
+        .expect("fixed column");
+    assert_eq!(elem_size, 8);
+    assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 7);
+
+    drop(reader);
+    drop(read_io);
+    drop(stdout);
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "clickhouse local exit: {status:?}");
+}
+
+/// Verifies Nested survives write and read as `Array(Tuple(fields))`.
+///
+/// Server keeps Nested whole only under `flatten_nested=0`; default flattens
+/// it into one `name.field Array(T)` column per field.
+#[test]
+fn write_then_read_back_nested() {
+    if !clickhouse_on_path() {
+        eprintln!("clickhouse binary not found, skipping");
+        return;
+    }
+
+    let alloc = Allocator::stdlib();
+    let mut child = Command::new("clickhouse")
+        .args([
+            "local",
+            "--flatten_nested=0",
+            "--input-format",
+            "Native",
+            "--structure",
+            "n Nested(a UInt32, b String)",
+            "--format",
+            "Native",
+            "--output_format_native_encode_types_in_binary_format=0",
+            "-q",
+            "SELECT n FROM table",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn clickhouse local");
+
+    let stdin = child.stdin.take().expect("stdin piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+
+    let ty = TypeAst::parse("Nested(a UInt32, b String)", alloc).expect("nested type");
+    // Two rows hold three entries: [(1, x), (2, y)] and [(3, zzz)]
+    let a: [u32; 3] = [1, 2, 3];
+    let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let a_col = ColumnBuilder::fixed(&a_bytes, 4, a.len()).expect("uint32 leaf");
+    let (b_offsets, b_data) = string_column(&["x", "y", "zzz"]);
+    let b_col = ColumnBuilder::string(&b_offsets, &b_data, 3).expect("string leaf");
+    let entry_offsets = [2u64, 3];
+
+    let children = [a_col, b_col];
+    let mut ptrs = [std::ptr::null_mut(); 2];
+    let entries = ColumnBuilder::tuple(&children, &mut ptrs).expect("entry tuple");
+    let nested = entries.array(&entry_offsets, 2).expect("nested");
+
+    let mut io = PosixIo::new(stdin.as_fd());
+    let mut bb = BlockBuilder::new();
+    bb.append("n", ty.view(), &nested).expect("append nested");
+    bb.write(io.as_mut(), BlockOpts::default()).expect("write");
+    drop(io);
+    drop(stdin); // Signal EOF to child process
+
+    let mut read_io = PosixIo::new(stdout.as_fd());
+    let mut reader =
+        BlockReader::new(read_io.as_mut(), alloc, BlockOpts::default()).expect("reader");
+
+    let mut rows = 0;
+    while let Some(block) = reader.read().expect("read block") {
+        if block.n_rows() == 0 {
+            continue;
+        }
+        rows += block.n_rows();
+        let col_ty = block.column_type(0).expect("column type");
+        assert_eq!(col_ty.kind(), Some(Kind::Nested));
+        assert_eq!(col_ty.tuple_field_name(0), Some(&b"a"[..]));
+        assert_eq!(col_ty.tuple_field_name(1), Some(&b"b"[..]));
+
+        let col = block.column(0).expect("nested column");
+        assert!(matches!(col.layout(), Some(ColumnLayout::Array)));
+        assert_eq!(col.array_offsets(), Some(&entry_offsets[..]));
+
+        let entries = col.array_values().expect("entries");
+        assert_eq!(entries.tuple_arity(), 2);
+        let (es, bytes) = entries
+            .tuple_child(0)
+            .and_then(|c| c.fixed())
+            .expect("uint32 child");
+        assert_eq!(es, 4);
+        assert_eq!(bytes, &a_bytes[..]);
+        let (offsets, data) = entries
+            .tuple_child(1)
+            .and_then(|c| c.string())
+            .expect("string child");
+        assert_eq!((offsets, data), (&b_offsets[..], &b_data[..]));
+    }
+
+    drop(reader);
+    drop(read_io);
+    drop(stdout);
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "clickhouse local exit: {status:?}");
+    assert_eq!(rows, 2);
+}
+
 fn string_column(values: &[&str]) -> (Vec<u64>, Vec<u8>) {
     let mut offsets = Vec::with_capacity(values.len());
     let mut data = Vec::new();

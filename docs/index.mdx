@@ -187,7 +187,7 @@ array offsets, then slicing the string data.
 | `ColumnLayout::Fixed` | `column.fixed()` → `(elem_size, bytes)`, `n_rows * elem_size` little-endian bytes |
 | `ColumnLayout::String` | `column.string()` → `(offsets, data)`; `offsets[i]` is row `i`'s exclusive end, host byte order, row 0 starts at 0 |
 | `ColumnLayout::Nullable` | `column.null_map()` (one byte per row, 1 = `NULL`), `column.nullable_inner()` |
-| `ColumnLayout::Array` | `column.array_offsets()` (cumulative ends), `column.array_values()`; `Map` decodes as `Array(Tuple(K, V))` |
+| `ColumnLayout::Array` | `column.array_offsets()` (cumulative ends), `column.array_values()`; `Map` decodes as `Array(Tuple(K, V))`, `Nested` as `Array(Tuple(fields))` |
 | `ColumnLayout::Tuple` | `column.tuple_arity()`, `column.tuple_child(i)`; every child has the same row count |
 | `ColumnLayout::LowCardinality` | `column.low_cardinality()` → `key_size` (1/2/4/8), `keys`, `dict` |
 
@@ -325,8 +325,9 @@ let array = nullable.array(&array_offsets, 3)?;    // borrows nullable
 block.append("v", array_ty.view(), &array)?;       // borrows array until the write
 ```
 
-`Map(K, V)` is `Array(Tuple(K, V))`, and the geo types are tuples of tuples, so
-the same four constructors cover them.
+`Map(K, V)` is `Array(Tuple(K, V))`, `Nested(...)` is `Array(Tuple(fields))`,
+and the geo types are tuples of tuples, so the same four constructors cover
+them.
 
 ## Reading Native without a server {#native-without-a-server}
 
@@ -644,26 +645,36 @@ The block reader decodes:
 - `String`, `FixedString(N)`
 - `UUID`, `IPv4`, `IPv6`
 - `Enum8`, `Enum16`
-- `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`, `Nested(...)`
+- `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`; `Nested(...)` as
+  `Array(Tuple(fields))`
 - `LowCardinality(T)`
 - `Interval*`, with unit from `TypeRef::interval_unit`
 - `QBit(T, N)`, as a tuple of `N`-bit-wide bit-plane columns, MSB plane first
 - `Point`, `Ring`, `LineString`, `Polygon`, `MultiPolygon`, `MultiLineString`
-- `SimpleAggregateFunction(f, T)`, which decodes as its inner `T`
+- `SimpleAggregateFunction(f, T)`, which decodes as its first argument type
 - `JSON` and `Object('json')`, as `String` columns under string serialization
+
+A server sends `Nested` whole only under `flatten_nested=0`; the default
+flattens it into one `name.field Array(T)` column per field, which decode as
+plain arrays.
 
 `JSON` and `Object('json')` need `output_format_native_write_json_as_string=1`
 on the query; each row then arrives as one JSON document in a
 `ColumnLayout::String` column, and `ColumnBuilder::string` writes the same
-shape back.
+shape back. Hints and typed paths in the type name, as in
+``JSON(max_dynamic_paths=16, `a.b` UInt32)``, steer server storage rather than
+that serialization, so the parser skips them and the type keeps no children.
 
 `Variant`, `Dynamic`, and `AggregateFunction` are not decoded and return
-`ErrorKind::Type`; cast them to `String` server-side as a fallback.
+`ErrorKind::Type`; cast them to `String` server-side as a fallback. Both
+aggregate types still parse as type names: `TypeRef::agg_function` returns
+`f`, and children hold the argument types alone, the first carrying stored
+values.
 
 Type metadata is available without decoding a block: `TypeAst::parse` parses a
-type name, and `TypeRef` exposes the kind, children, tuple field names, enum
-entries, decimal precision and scale, `DateTime64` scale, `Interval` unit,
-timezone, and QBit dimension.
+type name, and `TypeRef` exposes the kind, children, `Tuple` and `Nested`
+field names, aggregate function name, enum entries, decimal precision and
+scale, `DateTime64` scale, `Interval` unit, timezone, and QBit dimension.
 
 ## Raw FFI {#raw-ffi}
 
