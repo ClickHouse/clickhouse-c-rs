@@ -319,11 +319,7 @@ impl<'a> TypeRef<'a> {
     pub fn name(&self) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_name(self.raw, &mut len) };
-        if p.is_null() {
-            None
-        } else {
-            Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
-        }
+        (!p.is_null()).then(|| unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
     }
 
     /// Returns number of entries for `Enum8` or `Enum16`.
@@ -344,13 +340,12 @@ impl<'a> TypeRef<'a> {
         unsafe {
             sys::chc_type_enum_at(self.raw, i, &mut name_ptr, &mut name_len, &mut value);
         }
-        if name_ptr.is_null() {
-            return None;
-        }
-        Some((
-            unsafe { slice::from_raw_parts(name_ptr.cast::<u8>(), name_len) },
-            value,
-        ))
+        (!name_ptr.is_null()).then(|| {
+            (
+                unsafe { slice::from_raw_parts(name_ptr.cast::<u8>(), name_len) },
+                value,
+            )
+        })
     }
 
     /// Returns `Tuple` or `Nested` field name bytes without UTF-8 validation.
@@ -380,17 +375,10 @@ impl<'a> TypeRef<'a> {
     }
 
     /// Formats type as a ClickHouse type name.
-    ///
-    /// Returns an empty string if required buffer length exceeds `usize`.
     pub fn format(&self) -> String {
         let needed = unsafe { sys::chc_type_format(self.raw, core::ptr::null_mut(), 0) };
-        if needed == 0 {
-            return String::new();
-        }
-        let Some(cap) = needed.checked_add(1) else {
-            return String::new();
-        };
-        let mut buf = vec![0u8; cap];
+        // C writes a trailing NUL past `needed` bytes
+        let mut buf = vec![0u8; needed.saturating_add(1)];
         let _ =
             unsafe { sys::chc_type_format(self.raw, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         buf.truncate(needed);
@@ -402,6 +390,7 @@ impl<'a> TypeRef<'a> {
 mod tests {
     use super::{IntervalUnit, Kind, TypeAst};
     use crate::Allocator;
+    use crate::sys;
 
     fn parse(name: &str) -> TypeAst {
         TypeAst::parse(name, Allocator::stdlib()).expect(name)
@@ -502,5 +491,119 @@ mod tests {
     fn unknown_discriminant_is_none() {
         assert_eq!(Kind::from_raw(i32::MAX), None);
         assert_eq!(Kind::from_raw(-1), None);
+    }
+
+    #[test]
+    fn unknown_interval_unit_is_none() {
+        assert_eq!(IntervalUnit::from_raw(sys::CHC_INTERVAL_NONE), None);
+        assert_eq!(IntervalUnit::from_raw(i32::MAX), None);
+    }
+
+    #[test]
+    fn every_c_interval_unit_maps_to_its_variant() {
+        for (raw, unit) in [
+            (sys::CHC_INTERVAL_NANOSECOND, IntervalUnit::Nanosecond),
+            (sys::CHC_INTERVAL_MICROSECOND, IntervalUnit::Microsecond),
+            (sys::CHC_INTERVAL_MILLISECOND, IntervalUnit::Millisecond),
+            (sys::CHC_INTERVAL_SECOND, IntervalUnit::Second),
+            (sys::CHC_INTERVAL_MINUTE, IntervalUnit::Minute),
+            (sys::CHC_INTERVAL_HOUR, IntervalUnit::Hour),
+            (sys::CHC_INTERVAL_DAY, IntervalUnit::Day),
+            (sys::CHC_INTERVAL_WEEK, IntervalUnit::Week),
+            (sys::CHC_INTERVAL_MONTH, IntervalUnit::Month),
+            (sys::CHC_INTERVAL_QUARTER, IntervalUnit::Quarter),
+            (sys::CHC_INTERVAL_YEAR, IntervalUnit::Year),
+        ] {
+            assert_eq!(IntervalUnit::from_raw(raw), Some(unit));
+        }
+    }
+
+    #[test]
+    fn fixed_string_reports_its_width() {
+        let ty = parse("FixedString(12)");
+        assert_eq!(ty.view().kind(), Some(Kind::FixedString));
+        assert_eq!(ty.view().fixed_size(), 12);
+        assert_eq!(ty.view().elem_size(), 12);
+        assert_eq!(parse("UInt32").view().fixed_size(), 0);
+    }
+
+    #[test]
+    fn decimal_carries_precision_and_scale() {
+        let ty = parse("Decimal(18, 4)");
+        assert_eq!(ty.view().kind(), Some(Kind::Decimal64));
+        assert_eq!(ty.view().decimal_precision(), 18);
+        assert_eq!(ty.view().decimal_scale(), 4);
+
+        let plain = parse("String");
+        assert_eq!(plain.view().decimal_precision(), 0);
+        assert_eq!(plain.view().decimal_scale(), 0);
+    }
+
+    #[test]
+    fn subsecond_scale_comes_from_the_type() {
+        assert_eq!(parse("DateTime64(9)").view().datetime64_scale(), 9);
+        assert_eq!(parse("Time64(3)").view().datetime64_scale(), 3);
+        assert_eq!(parse("DateTime").view().datetime64_scale(), 0);
+    }
+
+    #[test]
+    fn timezone_is_present_only_on_temporal_types() {
+        let ty = parse("DateTime64(3, 'Europe/Paris')");
+        assert_eq!(ty.view().timezone(), Some(&b"Europe/Paris"[..]));
+        assert_eq!(parse("UInt32").view().timezone(), None);
+    }
+
+    #[test]
+    fn every_parsed_type_reports_its_source_name() {
+        assert_eq!(
+            parse("Array(UInt32)").view().name(),
+            Some(&b"Array(UInt32)"[..])
+        );
+        let child = parse("Array(UInt32)");
+        let child = child.view().child(0).expect("element type");
+        assert_eq!(child.name(), Some(&b"UInt32"[..]));
+        assert_eq!(child.format(), "UInt32");
+    }
+
+    #[test]
+    fn enum_entries_are_addressable_by_index() {
+        let ty = parse("Enum8('red' = -1, 'green' = 2)");
+        let view = ty.view();
+        assert_eq!(view.kind(), Some(Kind::Enum8));
+        assert_eq!(view.enum_count(), 2);
+        assert_eq!(view.enum_at(0), Some((&b"red"[..], -1)));
+        assert_eq!(view.enum_at(1), Some((&b"green"[..], 2)));
+        assert_eq!(view.enum_at(2), None);
+    }
+
+    #[test]
+    fn enum_accessors_are_empty_off_enums() {
+        let ty = parse("UInt32");
+        assert_eq!(ty.view().enum_count(), 0);
+        assert_eq!(ty.view().enum_at(0), None);
+    }
+
+    #[test]
+    fn unnamed_and_out_of_range_fields_have_no_name() {
+        let ty = parse("Tuple(UInt8, String)");
+        assert_eq!(ty.view().tuple_field_name(0), None);
+        assert_eq!(ty.view().tuple_field_name(9), None);
+        assert_eq!(parse("UInt32").view().tuple_field_name(0), None);
+    }
+
+    #[test]
+    fn child_index_past_the_end_is_none() {
+        let ty = parse("Map(String, UInt64)");
+        assert_eq!(ty.view().n_children(), 2);
+        assert!(ty.view().child(2).is_none());
+        assert!(parse("UInt32").view().child(0).is_none());
+    }
+
+    #[test]
+    fn a_bad_type_name_is_an_error() {
+        let err = TypeAst::parse("NotAType(", Allocator::stdlib())
+            .err()
+            .expect("unterminated type name accepted");
+        assert_eq!(err.kind, crate::ErrorKind::Type);
     }
 }

@@ -276,11 +276,8 @@ impl<'b> Column<'b> {
         };
         let mut elem_size = 0usize;
         let ptr = unsafe { sys::chc_column_fixed_data(self.raw, &mut elem_size) };
-        if ptr.is_null() {
-            return None;
-        }
         let n = self.n_rows().checked_mul(elem_size)?;
-        let bytes = unsafe { slice::from_raw_parts(ptr.cast::<u8>(), n) };
+        let bytes = unsafe { slice_or_none(ptr.cast::<u8>(), n) }?;
         Some((elem_size, bytes))
     }
 
@@ -296,10 +293,7 @@ impl<'b> Column<'b> {
         let n = self.n_rows();
         let offsets_ptr = unsafe { sys::chc_column_string_offsets(self.raw) };
         let data_ptr = unsafe { sys::chc_column_string_data(self.raw) };
-        if offsets_ptr.is_null() || (data_ptr.is_null() && n > 0) {
-            return None;
-        }
-        let offsets = unsafe { slice::from_raw_parts(offsets_ptr, n) };
+        let offsets = unsafe { slice_or_none(offsets_ptr, n) }?;
         // Bound data by both final offset and recorded allocation size
         // SAFETY: String layout selects `str_` union member
         let capacity = unsafe { (*self.raw).payload.str_.bytes };
@@ -309,10 +303,11 @@ impl<'b> Column<'b> {
             "clickhouse-c published string offsets outside its own data slab",
         );
         let data_len = claimed.min(capacity);
-        let data = if data_len == 0 || data_ptr.is_null() {
+        // Rows of empty strings leave no slab to borrow
+        let data = if data_len == 0 {
             &[][..]
         } else {
-            unsafe { slice::from_raw_parts(data_ptr, data_len) }
+            unsafe { slice_or_none(data_ptr, data_len) }?
         };
         Some((offsets, data))
     }
@@ -322,10 +317,7 @@ impl<'b> Column<'b> {
             return None;
         };
         let p = unsafe { sys::chc_column_null_map(self.raw) };
-        if p.is_null() {
-            return None;
-        }
-        Some(unsafe { slice::from_raw_parts(p, self.n_rows()) })
+        unsafe { slice_or_none(p, self.n_rows()) }
     }
 
     pub fn nullable_inner(&self) -> Option<Column<'b>> {
@@ -345,11 +337,7 @@ impl<'b> Column<'b> {
             return None;
         };
         let p = unsafe { sys::chc_column_array_offsets(self.raw) };
-        if p.is_null() {
-            None
-        } else {
-            Some(unsafe { slice::from_raw_parts(p, self.n_rows()) })
-        }
+        unsafe { slice_or_none(p, self.n_rows()) }
     }
 
     pub fn array_values(&self) -> Option<Column<'b>> {
@@ -386,29 +374,32 @@ impl<'b> Column<'b> {
             return None;
         };
         let key_size = unsafe { sys::chc_column_lc_key_size(self.raw) };
-        if key_size <= 0 {
-            return None;
-        }
+        let key_size = usize::try_from(key_size).ok().filter(|&k| k > 0)?;
         debug_assert!(
             matches!(key_size, 1 | 2 | 4 | 8),
             "clickhouse-c published LowCardinality key_size = {key_size}",
         );
         let keys_ptr = unsafe { sys::chc_column_lc_keys(self.raw) };
-        let dict_ptr = unsafe { sys::chc_column_lc_dict(self.raw) };
-        if keys_ptr.is_null() || dict_ptr.is_null() {
-            return None;
-        }
-        let keys_len = self.n_rows().checked_mul(key_size as usize)?;
-        let keys = unsafe { slice::from_raw_parts(keys_ptr.cast::<u8>(), keys_len) };
+        let dict = NonNull::new(unsafe { sys::chc_column_lc_dict(self.raw) }.cast_mut())?;
+        let keys_len = self.n_rows().checked_mul(key_size)?;
+        let keys = unsafe { slice_or_none(keys_ptr.cast::<u8>(), keys_len) }?;
         Some(LowCardinalityView {
-            key_size: key_size as usize,
+            key_size,
             keys,
             dict: Column {
-                raw: dict_ptr,
+                raw: dict.as_ptr(),
                 _marker: core::marker::PhantomData,
             },
         })
     }
+}
+
+/// Borrows `len` elements published by C, or None when C published no slab.
+///
+/// # Safety
+/// `p` must be null or point to `len` initialized elements that outlive `'b`.
+unsafe fn slice_or_none<'b, T>(p: *const T, len: usize) -> Option<&'b [T]> {
+    (!p.is_null()).then(|| unsafe { slice::from_raw_parts(p, len) })
 }
 
 /// Borrowed parts of a LowCardinality column.
@@ -420,4 +411,48 @@ pub struct LowCardinalityView<'b> {
     pub keys: &'b [u8],
     /// Dictionary referenced by keys.
     pub dict: Column<'b>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockOpts, ColumnLayout};
+    use crate::sys;
+
+    // Layouts added to C API must not convert to an adjacent Rust variant
+    #[test]
+    fn unknown_layout_is_none() {
+        assert!(ColumnLayout::from_raw(i32::MAX).is_none());
+        assert!(ColumnLayout::from_raw(-1).is_none());
+    }
+
+    #[test]
+    fn every_c_layout_maps_to_its_variant() {
+        for (raw, layout) in [
+            (sys::CHC_COL_FIXED, ColumnLayout::Fixed),
+            (sys::CHC_COL_STRING, ColumnLayout::String),
+            (sys::CHC_COL_NULLABLE, ColumnLayout::Nullable),
+            (sys::CHC_COL_ARRAY, ColumnLayout::Array),
+            (sys::CHC_COL_TUPLE, ColumnLayout::Tuple),
+            (sys::CHC_COL_LOW_CARDINALITY, ColumnLayout::LowCardinality),
+            (sys::CHC_COL_NOTHING, ColumnLayout::Nothing),
+        ] {
+            assert_eq!(
+                ColumnLayout::from_raw(raw).expect("known layout") as i32,
+                layout as i32,
+            );
+        }
+    }
+
+    #[test]
+    fn opts_carry_tcp_framing_into_c() {
+        let raw = BlockOpts {
+            has_block_info: true,
+            has_custom_serialization: true,
+            read_buffer_bytes: 4096,
+        }
+        .to_raw();
+        assert!(raw.has_block_info);
+        assert!(raw.has_custom_serialization);
+        assert_eq!(raw.read_buffer_bytes, 4096);
+    }
 }

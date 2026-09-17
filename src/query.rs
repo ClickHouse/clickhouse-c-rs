@@ -205,9 +205,9 @@ mod tests {
     #[test]
     fn interior_nul_is_a_usage_error() {
         let settings = [QuerySetting::new("max_block_size", "8\u{0}192")];
-        let Err(err) = RawQueryOpts::new(&QueryOpts::new().settings(&settings)) else {
-            panic!("interior NUL accepted");
-        };
+        let err = RawQueryOpts::new(&QueryOpts::new().settings(&settings))
+            .err()
+            .expect("interior NUL accepted");
         assert_eq!(err.kind, ErrorKind::Usage);
         assert!(err.message.contains("query setting value"), "{err}");
     }

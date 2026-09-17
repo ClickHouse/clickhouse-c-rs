@@ -158,14 +158,65 @@ unsafe extern "C" fn tls_write(
 unsafe fn set_err(err: *mut sys::chc_err, code: c_int, msg: &str) -> c_int {
     if !err.is_null() {
         let e = unsafe { &mut *err };
-        let cap = e.msg.len();
-        if cap > 0 {
-            let n = msg.len().min(cap - 1);
-            for (slot, b) in e.msg.iter_mut().zip(msg.as_bytes()[..n].iter()) {
-                *slot = *b as core::ffi::c_char;
-            }
-            e.msg[n] = 0;
+        let n = msg.len().min(e.msg.len() - 1);
+        for (slot, b) in e.msg.iter_mut().zip(msg.as_bytes()[..n].iter()) {
+            *slot = *b as core::ffi::c_char;
         }
+        e.msg[n] = 0;
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_config, set_err, tls_read};
+    use crate::sys;
+
+    #[test]
+    fn webpki_roots_build_a_usable_config() {
+        let name = super::rustls::pki_types::ServerName::try_from("example.com")
+            .expect("valid server name");
+        super::rustls::ClientConnection::new(default_config(), name).expect("client connection");
+    }
+
+    // A zero-length read must answer without touching the stream, so C can
+    // ask for nothing without the callback forming a slice over null
+    #[test]
+    fn zero_length_read_reports_no_bytes() {
+        let mut out_n = usize::MAX;
+        let mut err = sys::chc_err::zeroed();
+        let rc = unsafe {
+            tls_read(
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+                &mut out_n,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, sys::CHC_OK);
+        assert_eq!(out_n, 0);
+    }
+
+    #[test]
+    fn long_messages_stay_null_terminated() {
+        let mut e = sys::chc_err::zeroed();
+        let long = "e".repeat(e.msg.len() * 2);
+        assert_eq!(
+            unsafe { set_err(&mut e, sys::CHC_ERR_IO, &long) },
+            sys::CHC_ERR_IO,
+        );
+        assert_eq!(e.msg[e.msg.len() - 1], 0);
+        let text = e.msg.iter().take_while(|&&b| b != 0).count();
+        assert_eq!(text, e.msg.len() - 1);
+    }
+
+    // C passes a null error slot when it only wants the return code
+    #[test]
+    fn a_missing_error_slot_is_ignored() {
+        assert_eq!(
+            unsafe { set_err(core::ptr::null_mut(), sys::CHC_ERR_IO, "dropped") },
+            sys::CHC_ERR_IO,
+        );
+    }
 }

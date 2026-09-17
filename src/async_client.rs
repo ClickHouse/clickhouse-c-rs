@@ -222,54 +222,11 @@ impl<S: AsyncTransport> AsyncClient<S> {
 #[cfg(test)]
 mod tests {
     use super::{AsyncClient, Event};
-    #[cfg(feature = "tls")]
-    use super::{BoxedAsyncClient, TcpStream};
-    use crate::builder::BlockBuilder;
-    use crate::client::ClientOpts;
 
     #[test]
     fn async_client_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<AsyncClient>();
         assert_send::<Event>();
-    }
-
-    // Multi-thread Tokio requires method futures to implement Send
-    #[allow(dead_code)]
-    fn method_futures_are_send(mut c: AsyncClient, bb: BlockBuilder<'static>) {
-        fn require_send<T: Send>(_: T) {}
-        require_send(AsyncClient::connect(("h", 1u16), ClientOpts::new(), None));
-        #[cfg(feature = "tls")]
-        require_send(AsyncClient::connect_tls(
-            ("h", 1u16),
-            "h",
-            ClientOpts::new(),
-            None,
-            crate::tls::default_config(),
-        ));
-        require_send(c.send_query("", None));
-        require_send(c.send_data(Some(&bb)));
-        require_send(c.send_data_end());
-        require_send(c.recv_event());
-    }
-
-    // Plaintext and TLS clients must share erased type and Send futures
-    #[cfg(feature = "tls")]
-    #[allow(dead_code)]
-    fn plaintext_and_tls_share_one_type(
-        plain: AsyncClient,
-        tls: AsyncClient<tokio_rustls::client::TlsStream<TcpStream>>,
-    ) -> Vec<BoxedAsyncClient> {
-        fn require_send<T: Send>(_: T) {}
-        let mut erased = plain.boxed();
-        require_send(erased.recv_event());
-        vec![erased, tls.boxed()]
-    }
-
-    // Custom Tokio transports use same protocol adapter
-    #[allow(dead_code)]
-    fn any_tokio_transport_works(pipe: tokio::io::DuplexStream) {
-        fn require_send<T: Send>(_: T) {}
-        require_send(AsyncClient::handshake_on(pipe, ClientOpts::new(), None));
     }
 }

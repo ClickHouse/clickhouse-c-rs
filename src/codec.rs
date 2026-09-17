@@ -144,7 +144,7 @@ pub fn cityhash128(data: &[u8]) -> (u64, u64) {
 mod tests {
     use core::ffi::{c_int, c_void};
 
-    use super::{Codec, Compression};
+    use super::{Codec, Compression, cityhash128};
     use crate::sys;
 
     #[test]
@@ -168,6 +168,73 @@ mod tests {
 
         unsafe { codec.as_mut().raw_mut().lz4_bound = Some(stub_bound) };
         assert!(codec.as_ref().supports(Compression::Lz4));
+
+        // Installed pointers are what C would call
+        let raw = unsafe { codec.as_mut().raw_mut() };
+        let mut err = sys::chc_err::zeroed();
+        let mut written = 0usize;
+        assert_eq!(unsafe { raw.lz4_bound.expect("bound")(7) }, 7);
+        assert_eq!(
+            unsafe {
+                raw.lz4_compress.expect("compress")(
+                    raw.ud,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &mut written,
+                    &mut err,
+                )
+            },
+            sys::CHC_OK,
+        );
+        assert_eq!(
+            unsafe {
+                raw.lz4_decompress.expect("decompress")(
+                    raw.ud,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &mut err,
+                )
+            },
+            sys::CHC_OK,
+        );
+    }
+
+    // Custom codecs arrive as a filled table rather than through raw_mut
+    #[test]
+    fn from_raw_keeps_every_callback() {
+        let table = sys::chc_codec {
+            ud: core::ptr::null_mut(),
+            lz4_compress: Some(stub_compress),
+            lz4_decompress: Some(stub_decompress),
+            lz4_bound: Some(stub_bound),
+            zstd_compress: Some(stub_compress),
+            zstd_decompress: Some(stub_decompress),
+            zstd_bound: Some(stub_bound),
+        };
+        let codec = unsafe { Codec::from_raw(table) };
+        assert!(codec.as_ref().supports(Compression::Lz4));
+        assert!(codec.as_ref().supports(Compression::Zstd));
+        assert!(!codec.as_ref().as_ptr().is_null());
+    }
+
+    // Wire order is low word first. Vectors match clickhouse-cpp CityHash128,
+    // which is what a server checksums against
+    #[test]
+    fn cityhash128_matches_the_reference_digest() {
+        assert_eq!(cityhash128(b""), (0x3df09dfc64c09a2b, 0x3cb540c392e51e29));
+        assert_eq!(
+            cityhash128(b"Hello, World!"),
+            (0x703dabf8d081ec00, 0xa196e28f28c3ee09),
+        );
+        // 200 bytes reach the unrolled path for inputs of 128 bytes and more
+        assert_eq!(
+            cityhash128(&[0xab; 200]),
+            (0xb29e1d196fe650df, 0x3dae10d6a77e0432),
+        );
     }
 
     // Test only checks whether callback is present

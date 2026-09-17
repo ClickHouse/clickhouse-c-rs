@@ -213,3 +213,75 @@ fn a_fresh_machine_queues_hello_and_waits() {
 
     let _ = QuerySetting::TEXT_TYPE_NAMES; // I/O-independent API does not support settings
 }
+
+/// Step answers both questions a pump asks of it.
+#[test]
+fn step_reports_readiness_and_unwraps_its_value() {
+    let ready = Step::Ready(9u8);
+    assert!(ready.is_ready());
+    assert_eq!(ready.ready(), Some(9));
+
+    let waiting: Step<u8> = Step::NeedsInput;
+    assert!(!waiting.is_ready());
+    assert_eq!(waiting.ready(), None);
+}
+
+/// A compression request needs its codec before any transport exists.
+#[test]
+fn compression_is_validated_without_a_connection() {
+    let Err(err) = IolessClient::new(
+        &ClientOpts::new().compression(clickhouse_c::Compression::Lz4),
+        Allocator::stdlib(),
+        None,
+    ) else {
+        panic!("compression without a codec must be rejected");
+    };
+    assert_eq!(err.kind, clickhouse_c::ErrorKind::Usage);
+}
+
+/// A codec reaches C through client options, so the table must survive
+/// construction of a compressed client.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_compressed_client_keeps_its_codec() {
+    let mut core = IolessClient::new(
+        &ClientOpts::new().compression(clickhouse_c::Compression::Lz4),
+        Allocator::stdlib(),
+        Some(clickhouse_c::Codec::lz4()),
+    )
+    .expect("construct");
+    assert!(matches!(
+        core.handshake().expect("handshake step"),
+        Step::NeedsInput
+    ));
+    assert!(!core.pending_out().is_empty());
+}
+
+/// Before the handshake completes the client reports the revision it asked
+/// for rather than a server name.
+#[test]
+fn server_info_is_available_before_the_handshake() {
+    let core = IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None).expect("construct");
+    let info = core.server_info().expect("server info slot");
+    assert!(info.name.is_empty());
+    assert_eq!(
+        info.revision,
+        clickhouse_c::sys::CHC_CLIENT_DEFAULT_REVISION
+    );
+}
+
+/// Garbage in place of a Hello reply must surface as a protocol error, and the
+/// client must stay usable enough to report it.
+#[test]
+fn a_bogus_hello_reply_is_a_protocol_error() {
+    let mut core = IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None).expect("new");
+    assert!(matches!(
+        core.handshake().expect("handshake step"),
+        Step::NeedsInput
+    ));
+    core.submit(&[0xff; 64]).expect("submit");
+    let Err(err) = core.handshake() else {
+        panic!("garbage accepted as Hello");
+    };
+    assert_eq!(err.kind, clickhouse_c::ErrorKind::Protocol);
+}

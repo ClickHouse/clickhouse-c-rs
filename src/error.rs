@@ -127,4 +127,45 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Protocol);
         assert_eq!(err.message, "bad handshake");
     }
+
+    #[test]
+    fn every_c_code_maps_to_its_kind() {
+        for (code, kind) in [
+            (sys::CHC_ERR_IO, ErrorKind::Io),
+            (sys::CHC_ERR_EOF, ErrorKind::Eof),
+            (sys::CHC_ERR_PROTOCOL, ErrorKind::Protocol),
+            (sys::CHC_ERR_TYPE, ErrorKind::Type),
+            (sys::CHC_ERR_OOM, ErrorKind::Oom),
+            (sys::CHC_ERR_CANCELLED, ErrorKind::Cancelled),
+            (sys::CHC_ERR_SERVER, ErrorKind::Server),
+            (sys::CHC_ERR_USAGE, ErrorKind::Usage),
+            (sys::CHC_WOULD_BLOCK, ErrorKind::WouldBlock),
+        ] {
+            assert_eq!(ErrorKind::from_code(code), kind, "code {code}");
+        }
+    }
+
+    // Codes added to C API must not collapse into a represented variant
+    #[test]
+    fn unknown_code_keeps_its_number() {
+        assert_eq!(ErrorKind::from_code(-4242), ErrorKind::Other(-4242));
+    }
+
+    #[test]
+    fn transport_errors_become_io_kind() {
+        let err: Error = std::io::Error::other("socket went away").into();
+        assert_eq!(err.kind, ErrorKind::Io);
+        assert!(err.message.contains("socket went away"), "{err}");
+        assert_eq!(err.server_code, 0);
+        assert!(err.server_name.is_empty());
+    }
+
+    // Message array need not be NUL-terminated when C fills every byte
+    #[test]
+    fn unterminated_message_reads_to_capacity() {
+        let mut e = sys::chc_err::zeroed();
+        e.msg.fill(b'x' as core::ffi::c_char);
+        let err = check(sys::CHC_ERR_IO, &e).unwrap_err();
+        assert_eq!(err.message.len(), e.msg.len());
+    }
 }

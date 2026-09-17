@@ -308,3 +308,23 @@ unsafe impl Io for SliceIo<'_> {
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::slice_write;
+    use crate::sys;
+
+    // C may ask for the return code alone, without an error slot to fill
+    #[test]
+    fn a_rejected_write_needs_no_error_slot() {
+        let rc = unsafe {
+            slice_write(
+                core::ptr::null_mut(),
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, sys::CHC_ERR_IO);
+    }
+}

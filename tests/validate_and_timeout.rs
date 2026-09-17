@@ -5,7 +5,7 @@ use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 use clickhouse_c::{
-    Allocator, BlockBuilder, BlockOpts, BlockReader, CancelToken, ColumnBuilder, ErrorKind,
+    Allocator, BlockBuilder, BlockOpts, BlockReader, CancelToken, ColumnBuilder, ErrorKind, Io,
     PosixIo, TypeAst,
 };
 
@@ -217,5 +217,64 @@ fn cancel_during_a_parked_read_lands_on_the_next_attempt() {
         panic!("cancelled reader must not return a block");
     };
     assert_eq!(next.kind, ErrorKind::Cancelled, "got {next:?}");
+    drop(writer);
+}
+
+/// An owning cancellable transport closes its descriptor and still honours the
+/// token, so callers need not keep the socket alive themselves.
+#[test]
+fn an_owned_cancellable_transport_honours_its_token() {
+    let alloc = Allocator::stdlib();
+    let (writer, reader) = loopback_pair();
+    write_block(&writer, &[4, 5]);
+
+    let cancel = CancelToken::new();
+    let mut rio = PosixIo::new_owned_cancellable(reader, cancel.clone());
+    let mut block_reader =
+        BlockReader::new(rio.as_mut(), alloc, BlockOpts::default()).expect("reader");
+    assert_eq!(
+        block_reader
+            .read()
+            .expect("first read")
+            .expect("one block on the wire")
+            .n_rows(),
+        2,
+    );
+
+    cancel.cancel();
+    let Err(err) = block_reader.read() else {
+        panic!("cancelled reader must not return another block");
+    };
+    assert_eq!(err.kind, ErrorKind::Cancelled, "got {err:?}");
+    drop(writer);
+}
+
+/// A deadline set through the [`Io`] trait reaches the same descriptor state
+/// as the inherent setter, which is what [`Client`] relies on.
+///
+/// [`Client`]: clickhouse_c::Client
+#[test]
+fn the_io_trait_installs_a_posix_deadline() {
+    let alloc = Allocator::stdlib();
+    let (writer, reader) = loopback_pair();
+
+    let mut rio = PosixIo::new(reader.as_fd());
+    {
+        let dyn_io: core::pin::Pin<&mut dyn Io> = rio.as_mut();
+        dyn_io
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("posix transport supports deadlines");
+    }
+
+    let mut block_reader =
+        BlockReader::new(rio.as_mut(), alloc, BlockOpts::default()).expect("reader");
+    let Err(err) = block_reader.read() else {
+        panic!("idle read must fail");
+    };
+    assert_eq!(err.kind, ErrorKind::Io, "got {err:?}");
+    drop(block_reader);
+
+    let dyn_io: core::pin::Pin<&mut dyn Io> = rio.as_mut();
+    dyn_io.set_read_timeout(None).expect("clearing a deadline");
     drop(writer);
 }

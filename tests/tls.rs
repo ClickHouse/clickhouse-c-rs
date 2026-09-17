@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use clickhouse_c::tls::{self, rustls};
-use clickhouse_c::{Allocator, AsyncClient, Client, ClientOpts, Event};
+use clickhouse_c::{Allocator, AsyncClient, Client, ClientOpts, ErrorKind, Event};
 use common::{ChServer, TestResult, clickhouse_on_path};
 
 fn openssl_on_path() -> bool {
@@ -233,4 +233,127 @@ async fn sync_tls_roundtrip() -> TestResult {
     }
     assert_eq!(got, Some(42));
     Ok(())
+}
+
+/// An SNI name rustls cannot parse is rejected before any TLS traffic, for
+/// both the blocking and asynchronous entry points.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unparsable_server_name_is_a_usage_error() -> TestResult {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+
+    let tcp = TcpStream::connect(("127.0.0.1", port))?;
+    let Err(err) = tls::TlsIo::connect(tcp, "not a hostname", tls::default_config()) else {
+        panic!("blocking client accepted an unparsable server name");
+    };
+    assert_eq!(err.kind, ErrorKind::Usage);
+    assert!(err.message.contains("invalid TLS server name"), "{err}");
+
+    let Err(err) = AsyncClient::connect_tls(
+        ("127.0.0.1", port),
+        "not a hostname",
+        ClientOpts::new(),
+        None,
+        tls::default_config(),
+    )
+    .await
+    else {
+        panic!("async client accepted an unparsable server name");
+    };
+    assert_eq!(err.kind, ErrorKind::Usage);
+    Ok(())
+}
+
+/// A peer that answers the TCP connect but speaks no TLS must fail the
+/// handshake rather than hand back a client.
+#[test]
+fn a_plaintext_peer_fails_the_tls_handshake() -> TestResult {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let accepted = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        // Answer the ClientHello with bytes that are not a TLS record
+        let _ = io::Write::write_all(&mut sock, b"not tls at all\n");
+        sock
+    });
+
+    let tcp = TcpStream::connect(("127.0.0.1", port))?;
+    let Err(err) = tls::TlsIo::connect(tcp, "localhost", tls::default_config()) else {
+        panic!("plaintext peer completed a TLS handshake");
+    };
+    assert_eq!(err.kind, ErrorKind::Io);
+    drop(accepted.join().expect("listener thread"));
+    Ok(())
+}
+
+/// A deadline reaches the socket under the TLS stream, so an idle server
+/// surfaces as a read error from the callback rather than a hang.
+#[test]
+fn a_read_deadline_reaches_the_socket_under_tls() -> TestResult {
+    if skip() {
+        return Ok(());
+    }
+    let server = TlsServer::spawn()?;
+    let config = pinned_config(&server)?;
+
+    let tcp = TcpStream::connect(("127.0.0.1", server.secure_port()))?;
+    let io = tls::TlsIo::connect(tcp, "localhost", config)?;
+    let mut client = Client::init(&ClientOpts::new(), Allocator::stdlib(), io, None)?;
+
+    client.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;
+    let Err(err) = client.recv_event() else {
+        panic!("idle TLS connection produced an event");
+    };
+    assert_eq!(err.kind, ErrorKind::Io);
+    assert!(err.message.contains("tls read"), "{err}");
+
+    client.set_read_timeout(None)?;
+    Ok(())
+}
+
+/// Writing after the peer is gone must surface the transport error instead of
+/// reporting success for bytes nobody received.
+#[test]
+fn a_write_to_a_dead_peer_is_an_error() -> TestResult {
+    if skip() {
+        return Ok(());
+    }
+    let server = TlsServer::spawn()?;
+    let config = pinned_config(&server)?;
+
+    let tcp = TcpStream::connect(("127.0.0.1", server.secure_port()))?;
+    let io = tls::TlsIo::connect(tcp, "localhost", config)?;
+    let mut client = Client::init(&ClientOpts::new(), Allocator::stdlib(), io, None)?;
+    drop(server);
+
+    // First writes can land in socket buffers, so keep sending until the
+    // reset arrives
+    let big = "x".repeat(64 * 1024);
+    for _ in 0..64 {
+        if let Err(err) = client.send_query(&format!("SELECT '{big}'"), None) {
+            assert_eq!(err.kind, ErrorKind::Io);
+            assert!(err.message.contains("tls write"), "{err}");
+            return Ok(());
+        }
+    }
+    panic!("writes kept succeeding after the server was gone");
+}
+
+// Plaintext and TLS clients must share one erased type with Send futures
+#[allow(dead_code)]
+fn plaintext_and_tls_share_one_type(
+    plain: AsyncClient,
+    secure: AsyncClient<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+) -> Vec<clickhouse_c::BoxedAsyncClient> {
+    fn require_send<T: Send>(_: T) {}
+    let mut erased = plain.boxed();
+    require_send(erased.recv_event());
+    require_send(AsyncClient::connect_tls(
+        ("h", 1u16),
+        "h",
+        ClientOpts::new(),
+        None,
+        tls::default_config(),
+    ));
+    vec![erased, secure.boxed()]
 }
