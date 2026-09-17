@@ -111,8 +111,8 @@ impl<'a> ColumnBuilder<'a> {
     ///
     /// All children must have same row count. `ptrs` provides temporary
     /// pointer storage and must have same length as `children`. Returned
-    /// builder borrows both slices. Maps and geographic types use tuple
-    /// storage internally.
+    /// builder borrows both slices. Maps, nested values, and geographic
+    /// types use tuple storage internally.
     pub fn tuple<'r>(
         children: &'r [ColumnBuilder<'a>],
         ptrs: &'r mut [*mut sys::chc_column],

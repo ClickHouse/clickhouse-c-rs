@@ -26,8 +26,8 @@ pub enum ColumnLayout {
     String = sys::CHC_COL_STRING,
     /// Null map and dense inner column used by `Nullable(T)`.
     Nullable = sys::CHC_COL_NULLABLE,
-    /// Offsets and element column used by `Array(T)`, and `Map(K, V)` as
-    /// `Array(Tuple(K, V))`.
+    /// Offsets and element column used by `Array(T)`, `Map(K, V)` as
+    /// `Array(Tuple(K, V))`, and `Nested(...)` as `Array(Tuple(fields))`.
     Array = sys::CHC_COL_ARRAY,
     /// Parallel child columns used by tuples, nested values, geographic
     /// types, and QBit values.

@@ -186,6 +186,7 @@ unsafe extern "C" {
         i: usize,
         out_len: *mut usize,
     ) -> *const c_char;
+    pub fn chc_type_agg_function(t: *const chc_type, out_len: *mut usize) -> *const c_char;
 
     pub fn chc_type_format(t: *const chc_type, buf: *mut c_char, buf_len: usize) -> usize;
 }

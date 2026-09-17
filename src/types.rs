@@ -234,8 +234,9 @@ impl<'a> TypeRef<'a> {
 
     /// Returns number of child types.
     ///
-    /// Child types include array elements, tuple fields, map keys and values,
-    /// and inner types of `Nullable` and `LowCardinality`.
+    /// Child types include array elements, tuple and nested fields, map keys
+    /// and values, aggregate function argument types, and inner types of
+    /// `Nullable` and `LowCardinality`.
     pub fn n_children(&self) -> usize {
         unsafe { sys::chc_type_n_children(self.raw) }
     }
@@ -352,10 +353,25 @@ impl<'a> TypeRef<'a> {
         ))
     }
 
-    /// Returns tuple field name bytes without UTF-8 validation.
+    /// Returns `Tuple` or `Nested` field name bytes without UTF-8 validation.
     pub fn tuple_field_name(&self, i: usize) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_tuple_field_name(self.raw, i, &mut len) };
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
+        }
+    }
+
+    /// Returns function name of `AggregateFunction` or
+    /// `SimpleAggregateFunction` without UTF-8 validation.
+    ///
+    /// Function parameters are not part of name. Children hold argument
+    /// types, first of which carries stored values.
+    pub fn agg_function(&self) -> Option<&'a [u8]> {
+        let mut len = 0;
+        let p = unsafe { sys::chc_type_agg_function(self.raw, &mut len) };
         if p.is_null() {
             None
         } else {
@@ -428,6 +444,57 @@ mod tests {
             parse("MultiLineString").view().kind(),
             Some(Kind::MultiLineString)
         );
+    }
+
+    #[test]
+    fn nested_fields_carry_names() {
+        let ty = parse("Nested(a UInt32, b String)");
+        let view = ty.view();
+        assert_eq!(view.kind(), Some(Kind::Nested));
+        assert_eq!(view.n_children(), 2);
+        assert_eq!(view.tuple_field_name(0), Some(&b"a"[..]));
+        assert_eq!(view.tuple_field_name(1), Some(&b"b"[..]));
+    }
+
+    #[test]
+    fn aggregate_children_drop_function_parameters() {
+        let ty = parse("AggregateFunction(quantiles(0.5, 0.9), UInt64)");
+        let view = ty.view();
+        assert_eq!(view.kind(), Some(Kind::AggregateFunction));
+        assert_eq!(view.agg_function(), Some(&b"quantiles"[..]));
+        assert_eq!(view.n_children(), 1);
+        assert_eq!(view.child(0).and_then(|c| c.kind()), Some(Kind::UInt64));
+    }
+
+    // Server may prefix a serialization version before function name
+    #[test]
+    fn aggregate_version_prefix_parses() {
+        let ty = parse("AggregateFunction(1, sumMap, Array(UInt32), Array(UInt64))");
+        let view = ty.view();
+        assert_eq!(view.agg_function(), Some(&b"sumMap"[..]));
+        assert_eq!(view.n_children(), 2);
+    }
+
+    #[test]
+    fn simple_aggregate_stores_its_first_argument() {
+        let ty = parse("SimpleAggregateFunction(anyLast, Nullable(String))");
+        let view = ty.view();
+        assert_eq!(view.kind(), Some(Kind::SimpleAggregateFunction));
+        assert_eq!(view.agg_function(), Some(&b"anyLast"[..]));
+        assert_eq!(view.child(0).and_then(|c| c.kind()), Some(Kind::Nullable));
+    }
+
+    #[test]
+    fn agg_function_is_none_off_aggregates() {
+        assert_eq!(parse("Tuple(UInt32)").view().agg_function(), None);
+    }
+
+    // JSON hints steer server storage, not string serialization
+    #[test]
+    fn json_parameters_leave_no_children() {
+        let ty = parse("JSON(max_dynamic_paths=16, `a.b` UInt32, SKIP `a.e`)");
+        assert_eq!(ty.view().kind(), Some(Kind::Json));
+        assert_eq!(ty.view().n_children(), 0);
     }
 
     // Unknown C discriminants must not convert to adjacent Rust variants
