@@ -74,7 +74,6 @@ unsafe extern "C" {
     fn chc_rs_off_chc_client_opts__client_version_major() -> usize;
     fn chc_rs_off_chc_client_opts__client_version_minor() -> usize;
     fn chc_rs_off_chc_client_opts__client_version_patch() -> usize;
-    fn chc_rs_off_chc_client_opts__client_revision() -> usize;
     fn chc_rs_off_chc_client_opts__database() -> usize;
     fn chc_rs_off_chc_client_opts__user() -> usize;
     fn chc_rs_off_chc_client_opts__password() -> usize;
@@ -132,8 +131,10 @@ unsafe extern "C" {
     fn chc_rs_off_progress_rows() -> usize;
     fn chc_rs_off_progress_bytes() -> usize;
     fn chc_rs_off_progress_total_rows() -> usize;
+    fn chc_rs_off_progress_total_bytes() -> usize;
     fn chc_rs_off_progress_written_rows() -> usize;
     fn chc_rs_off_progress_written_bytes() -> usize;
+    fn chc_rs_off_progress_elapsed_ns() -> usize;
 
     fn chc_rs_size_profile() -> usize;
     fn chc_rs_off_profile_rows() -> usize;
@@ -360,11 +361,6 @@ fn chc_client_opts_matches_c() {
     );
     field!(
         sys::chc_client_opts,
-        client_revision,
-        chc_rs_off_chc_client_opts__client_revision
-    );
-    field!(
-        sys::chc_client_opts,
         database,
         chc_rs_off_chc_client_opts__database
     );
@@ -585,6 +581,11 @@ fn chc_packet_matches_c() {
             "total_rows",
         ),
         (
+            offset_of!(sys::chc_packet_progress, total_bytes),
+            unsafe { chc_rs_off_progress_total_bytes() },
+            "total_bytes",
+        ),
+        (
             offset_of!(sys::chc_packet_progress, written_rows),
             unsafe { chc_rs_off_progress_written_rows() },
             "written_rows",
@@ -593,6 +594,11 @@ fn chc_packet_matches_c() {
             offset_of!(sys::chc_packet_progress, written_bytes),
             unsafe { chc_rs_off_progress_written_bytes() },
             "written_bytes",
+        ),
+        (
+            offset_of!(sys::chc_packet_progress, elapsed_ns),
+            unsafe { chc_rs_off_progress_elapsed_ns() },
+            "elapsed_ns",
         ),
     ];
     for (rust_in_arm, c_abs, name) in progress {
@@ -671,7 +677,6 @@ fn zeroed_constructors_clear_every_field() {
     assert!(client.password.is_null());
     assert!(client.codec.is_null());
     assert_eq!(client.compression, sys::CHC_COMP_NONE);
-    assert_eq!(client.client_revision, 0);
     assert_eq!(client.read_buffer_bytes, 0);
 
     let packet = sys::chc_packet::zeroed();

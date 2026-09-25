@@ -264,10 +264,7 @@ fn server_info_is_available_before_the_handshake() {
     let core = IolessClient::new(&ClientOpts::new(), Allocator::stdlib(), None).expect("construct");
     let info = core.server_info().expect("server info slot");
     assert!(info.name.is_empty());
-    assert_eq!(
-        info.revision,
-        clickhouse_c::sys::CHC_CLIENT_DEFAULT_REVISION
-    );
+    assert_eq!(info.revision, clickhouse_c::sys::CHC_CLIENT_REVISION);
 }
 
 /// Garbage in place of a Hello reply must surface as a protocol error, and the

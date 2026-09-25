@@ -179,12 +179,13 @@ fn generate_constants(chc_dir: &Path, out_dir: &Path) {
         "\n// clickhouse.h: #define CHC_ERR_MSG_LEN\npub const CHC_ERR_MSG_LEN: usize = {msg_len};\n"
     ));
 
-    let revision = extract_define(&client_src, "CHC_CLIENT_DEFAULT_REVISION")
-        .expect("#define CHC_CLIENT_DEFAULT_REVISION missing from clickhouse-client.h");
-    out.push_str(&format!(
-        "\n// clickhouse-client.h: #define CHC_CLIENT_DEFAULT_REVISION\n\
-         pub const CHC_CLIENT_DEFAULT_REVISION: u64 = {revision};\n"
-    ));
+    for name in ["CHC_SERVER_MIN_REVISION", "CHC_CLIENT_REVISION"] {
+        let revision = extract_define(&client_src, name)
+            .unwrap_or_else(|| panic!("#define {name} missing from clickhouse-client.h"));
+        out.push_str(&format!(
+            "\n// clickhouse-client.h: #define {name}\npub const {name}: u64 = {revision};\n"
+        ));
+    }
 
     fs::write(out_dir.join("sys_constants.rs"), out).expect("write sys_constants.rs");
 }

@@ -75,7 +75,6 @@ CHC_RS_FIELD(chc_client_opts, client_name)
 CHC_RS_FIELD(chc_client_opts, client_version_major)
 CHC_RS_FIELD(chc_client_opts, client_version_minor)
 CHC_RS_FIELD(chc_client_opts, client_version_patch)
-CHC_RS_FIELD(chc_client_opts, client_revision)
 CHC_RS_FIELD(chc_client_opts, database)
 CHC_RS_FIELD(chc_client_opts, user)
 CHC_RS_FIELD(chc_client_opts, password)
@@ -129,8 +128,10 @@ size_t chc_rs_size_progress(void)  { return sizeof(((chc_packet *) 0)->progress)
 size_t chc_rs_off_progress_rows(void)          { return offsetof(chc_packet, progress.rows); }
 size_t chc_rs_off_progress_bytes(void)         { return offsetof(chc_packet, progress.bytes); }
 size_t chc_rs_off_progress_total_rows(void)    { return offsetof(chc_packet, progress.total_rows); }
+size_t chc_rs_off_progress_total_bytes(void)   { return offsetof(chc_packet, progress.total_bytes); }
 size_t chc_rs_off_progress_written_rows(void)  { return offsetof(chc_packet, progress.written_rows); }
 size_t chc_rs_off_progress_written_bytes(void) { return offsetof(chc_packet, progress.written_bytes); }
+size_t chc_rs_off_progress_elapsed_ns(void)    { return offsetof(chc_packet, progress.elapsed_ns); }
 
 size_t chc_rs_size_profile(void)   { return sizeof(((chc_packet *) 0)->profile); }
 size_t chc_rs_off_profile_rows(void)             { return offsetof(chc_packet, profile.rows); }
