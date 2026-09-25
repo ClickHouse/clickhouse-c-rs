@@ -34,10 +34,6 @@ pub struct ClientOpts {
     pub client_version_major: u64,
     pub client_version_minor: u64,
     pub client_version_patch: u64,
-    /// Requested native protocol revision. Zero uses
-    /// [`sys::CHC_CLIENT_DEFAULT_REVISION`]. Server limits negotiated revision
-    /// to its supported value.
-    pub client_revision: u64,
     pub compression: Compression,
     /// Read buffer size in bytes. Zero selects clickhouse-c 8 KiB default.
     pub read_buffer_bytes: usize,
@@ -82,12 +78,6 @@ impl ClientOpts {
         self
     }
 
-    /// Sets requested protocol revision.
-    pub fn client_revision(mut self, revision: u64) -> Self {
-        self.client_revision = revision;
-        self
-    }
-
     /// Sets compression algorithm.
     ///
     /// Compressed connections require a matching [`Codec`] in [`Client::init`].
@@ -117,7 +107,6 @@ impl ClientOpts {
                 client_version_major: self.client_version_major,
                 client_version_minor: self.client_version_minor,
                 client_version_patch: self.client_version_patch,
-                client_revision: self.client_revision,
                 database,
                 user,
                 password,
@@ -516,6 +505,7 @@ pub enum PacketKind {
     Log = sys::CHC_PKT_LOG,
     TableColumns = sys::CHC_PKT_TABLE_COLUMNS,
     ProfileEvents = sys::CHC_PKT_PROFILE_EVENTS,
+    TimezoneUpdate = sys::CHC_PKT_TIMEZONE_UPDATE,
 }
 
 impl PacketKind {
@@ -532,6 +522,7 @@ impl PacketKind {
             sys::CHC_PKT_LOG => Self::Log,
             sys::CHC_PKT_TABLE_COLUMNS => Self::TableColumns,
             sys::CHC_PKT_PROFILE_EVENTS => Self::ProfileEvents,
+            sys::CHC_PKT_TIMEZONE_UPDATE => Self::TimezoneUpdate,
             _ => return None,
         })
     }
@@ -564,6 +555,8 @@ pub enum Event {
     /// INSERT target metadata. Payload is not decoded. Following Data block
     /// contains same structure.
     TableColumns,
+    /// Server timezone changed. Read updated value from client server info.
+    TimezoneUpdate,
 }
 
 impl Event {
@@ -593,6 +586,7 @@ impl Event {
             PacketKind::Pong => Self::Pong,
             PacketKind::EndOfStream => Self::EndOfStream,
             PacketKind::TableColumns => Self::TableColumns,
+            PacketKind::TimezoneUpdate => Self::TimezoneUpdate,
         })
     }
 }
@@ -621,8 +615,10 @@ pub struct Progress {
     pub rows: u64,
     pub bytes: u64,
     pub total_rows: u64,
+    pub total_bytes: u64,
     pub written_rows: u64,
     pub written_bytes: u64,
+    pub elapsed_ns: u64,
 }
 
 impl Progress {
@@ -631,8 +627,10 @@ impl Progress {
             rows: raw.rows,
             bytes: raw.bytes,
             total_rows: raw.total_rows,
+            total_bytes: raw.total_bytes,
             written_rows: raw.written_rows,
             written_bytes: raw.written_bytes,
+            elapsed_ns: raw.elapsed_ns,
         }
     }
 }
@@ -714,8 +712,7 @@ mod tests {
             .database("db")
             .user("reader")
             .password("secret")
-            .client_version(1, 2, 3)
-            .client_revision(54465);
+            .client_version(1, 2, 3);
         let raw = opts.to_raw(None).expect("no interior NUL");
         let field = |p: *const core::ffi::c_char| unsafe { CStr::from_ptr(p) }.to_owned();
         let raw = unsafe { &*raw.as_ptr() };
@@ -731,7 +728,6 @@ mod tests {
             ),
             (1, 2, 3),
         );
-        assert_eq!(raw.client_revision, 54465);
         assert!(raw.codec.is_null());
     }
 
@@ -764,7 +760,7 @@ mod tests {
     }
 
     // Every packet kind, with whether C hands over a payload pointer
-    const KINDS: [(sys::chc_packet_kind, bool); 11] = [
+    const KINDS: [(sys::chc_packet_kind, bool); 12] = [
         (sys::CHC_PKT_DATA, true),
         (sys::CHC_PKT_TOTALS, true),
         (sys::CHC_PKT_EXTREMES, true),
@@ -776,6 +772,7 @@ mod tests {
         (sys::CHC_PKT_PONG, false),
         (sys::CHC_PKT_END_OF_STREAM, false),
         (sys::CHC_PKT_TABLE_COLUMNS, false),
+        (sys::CHC_PKT_TIMEZONE_UPDATE, false),
     ];
 
     // A payload-carrying kind whose payload C left null must not convert, and
@@ -799,6 +796,10 @@ mod tests {
             assert_eq!(
                 matches!(event, Ok(Event::TableColumns)),
                 kind == sys::CHC_PKT_TABLE_COLUMNS,
+            );
+            assert_eq!(
+                matches!(event, Ok(Event::TimezoneUpdate)),
+                kind == sys::CHC_PKT_TIMEZONE_UPDATE,
             );
             assert_eq!(
                 matches!(event, Ok(Event::Progress(_))),

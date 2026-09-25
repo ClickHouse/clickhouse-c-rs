@@ -495,7 +495,6 @@ pub struct chc_client_opts {
     pub client_version_major: u64,
     pub client_version_minor: u64,
     pub client_version_patch: u64,
-    pub client_revision: u64,
     pub database: *const c_char,
     pub user: *const c_char,
     pub password: *const c_char,
@@ -511,7 +510,6 @@ impl chc_client_opts {
             client_version_major: 0,
             client_version_minor: 0,
             client_version_patch: 0,
-            client_revision: 0,
             database: core::ptr::null(),
             user: core::ptr::null(),
             password: core::ptr::null(),
@@ -555,8 +553,10 @@ pub struct chc_packet_progress {
     pub rows: u64,
     pub bytes: u64,
     pub total_rows: u64,
+    pub total_bytes: u64,
     pub written_rows: u64,
     pub written_bytes: u64,
+    pub elapsed_ns: u64,
 }
 
 #[repr(C)]

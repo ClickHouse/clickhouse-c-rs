@@ -2,7 +2,8 @@
 
 `clickhouse-c-rs` provides Rust bindings for
 [`clickhouse-c`](https://github.com/ClickHouse/clickhouse-c), a C library for
-ClickHouse Native format and native TCP protocol.
+ClickHouse Native format and native TCP protocol. Clients require ClickHouse 23.3
+or newer and advertise protocol revision 54465.
 
 Crate provides three levels of access:
 

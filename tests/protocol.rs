@@ -15,7 +15,7 @@ use common::{ChServer, TestResult, clickhouse_on_path};
 fn connect(server: &ChServer) -> TestResult<Client<'static>> {
     let sock = TcpStream::connect(("127.0.0.1", server.tcp_port))?;
     Ok(Client::init(
-        &ClientOpts::new().client_revision(clickhouse_c::sys::CHC_CLIENT_DEFAULT_REVISION),
+        &ClientOpts::new(),
         Allocator::stdlib(),
         PosixIo::new_owned(sock),
         None,
@@ -49,6 +49,7 @@ fn drain(client: &mut Client<'_>) -> TestResult<Seen> {
             Event::ProfileInfo(_) => seen.profile_info += 1,
             Event::Progress(_) => seen.progress += 1,
             Event::TableColumns => seen.table_columns += 1,
+            Event::TimezoneUpdate => {}
             Event::Pong => panic!("unexpected Pong during a query"),
         }
     }
