@@ -13,7 +13,7 @@ use std::ffi::CString;
 
 use crate::alloc::Allocator;
 use crate::block::Block;
-use crate::builder::BlockBuilder;
+use crate::builder::{BlockBuilder, PreparedBlock};
 use crate::codec::{Codec, Compression};
 use crate::error::{Error, ErrorKind, Result, check};
 use crate::io::Io;
@@ -334,6 +334,16 @@ impl<'fd> Client<'fd> {
         let bb_ptr = builder.map(|b| b.as_ptr()).unwrap_or(core::ptr::null());
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_send_data(self.raw.as_ptr(), bb_ptr, &mut err) };
+        check(rc, &err)
+    }
+
+    /// Sends a block prepared with [`BlockBuilder::prepare`].
+    ///
+    /// Fails without writing when connection negotiated other compression.
+    pub fn send_prepared(&mut self, block: &PreparedBlock) -> Result<()> {
+        let mut err = sys::chc_err::zeroed();
+        let rc =
+            unsafe { sys::chc_client_send_prepared(self.raw.as_ptr(), block.as_ptr(), &mut err) };
         check(rc, &err)
     }
 

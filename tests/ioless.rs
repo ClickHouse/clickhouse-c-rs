@@ -8,7 +8,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use clickhouse_c::{
-    Allocator, ClientOpts, Event, IolessClient, QuerySetting, Result, Step, TypeAst,
+    Allocator, ClientOpts, Compression, Event, IolessClient, PreparedBlock, QuerySetting, Result,
+    Step, TypeAst,
 };
 use common::{ChServer, TestResult, clickhouse_on_path};
 
@@ -169,7 +170,7 @@ fn a_hand_written_pump_runs_an_insert() -> TestResult {
     block.append("n", ty.view(), &col)?;
 
     core.send_data(Some(&block))?;
-    core.send_data(None)?;
+    core.send_prepared(&PreparedBlock::end(Compression::None, None, alloc)?)?;
     loop {
         match drive(&mut core, &mut pump, |c| c.recv_event())? {
             Event::EndOfStream => break,

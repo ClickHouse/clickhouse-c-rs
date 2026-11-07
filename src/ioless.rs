@@ -10,7 +10,7 @@ use core::slice;
 use std::ffi::c_char;
 
 use crate::alloc::Allocator;
-use crate::builder::BlockBuilder;
+use crate::builder::{BlockBuilder, PreparedBlock};
 use crate::client::{ClientOpts, Event, ServerInfo, take_handshake_exception};
 use crate::codec::Codec;
 use crate::error::{Result, check};
@@ -185,6 +185,18 @@ impl IolessClient {
         let bb_ptr = builder.map(|b| b.as_ptr()).unwrap_or(core::ptr::null());
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_async_send_data(self.raw.as_ptr(), bb_ptr, &mut err) };
+        check(rc, &err)
+    }
+
+    /// Queues a block prepared with [`BlockBuilder::prepare`], see
+    /// [`Client::send_prepared`](crate::Client::send_prepared).
+    pub fn send_prepared(&mut self, block: &PreparedBlock) -> Result<()> {
+        self.send_prepared_raw(block.as_ptr())
+    }
+
+    pub(crate) fn send_prepared_raw(&mut self, pb: *const sys::chc_prepared_block) -> Result<()> {
+        let mut err = sys::chc_err::zeroed();
+        let rc = unsafe { sys::chc_async_send_prepared(self.raw.as_ptr(), pb, &mut err) };
         check(rc, &err)
     }
 

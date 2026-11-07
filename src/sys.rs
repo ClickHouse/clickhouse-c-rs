@@ -490,6 +490,29 @@ unsafe extern "C" {
 /* Native protocol client */
 
 #[repr(C)]
+pub struct chc_prepared_block {
+    pub compression: chc_compression,
+    pub n_rows: u64,
+    pub raw_len: usize,
+    pub bytes: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+impl chc_prepared_block {
+    pub const fn zeroed() -> Self {
+        Self {
+            compression: 0,
+            n_rows: 0,
+            raw_len: 0,
+            bytes: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        }
+    }
+}
+
+#[repr(C)]
 pub struct chc_client_opts {
     pub client_name: *const c_char,
     pub client_version_major: u64,
@@ -658,6 +681,20 @@ unsafe extern "C" {
         bb: *const chc_block_builder,
         err: *mut chc_err,
     ) -> c_int;
+    pub fn chc_block_prepare(
+        bb: *const chc_block_builder,
+        compression: chc_compression,
+        codec: *const chc_codec,
+        al: *const chc_alloc,
+        out: *mut chc_prepared_block,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_prepared_block_free(pb: *mut chc_prepared_block, al: *const chc_alloc);
+    pub fn chc_client_send_prepared(
+        c: *mut chc_client,
+        pb: *const chc_prepared_block,
+        err: *mut chc_err,
+    ) -> c_int;
     pub fn chc_client_send_cancel(c: *mut chc_client, err: *mut chc_err) -> c_int;
     pub fn chc_client_send_ping(c: *mut chc_client, err: *mut chc_err) -> c_int;
     pub fn chc_exception_free(e: *mut chc_exception, al: *const chc_alloc);
@@ -708,6 +745,11 @@ unsafe extern "C" {
         err: *mut chc_err,
     ) -> c_int;
     pub fn chc_async_send_data_end(c: *mut chc_async_client, err: *mut chc_err) -> c_int;
+    pub fn chc_async_send_prepared(
+        c: *mut chc_async_client,
+        pb: *const chc_prepared_block,
+        err: *mut chc_err,
+    ) -> c_int;
     pub fn chc_async_recv_packet(
         c: *mut chc_async_client,
         out: *mut chc_packet,

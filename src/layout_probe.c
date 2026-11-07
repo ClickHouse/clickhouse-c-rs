@@ -70,6 +70,14 @@ CHC_RS_FIELD(chc_codec, lz4_bound)
 CHC_RS_FIELD(chc_codec, zstd_bound)
 
 /* clickhouse-client.h */
+CHC_RS_LAYOUT(chc_prepared_block)
+CHC_RS_FIELD(chc_prepared_block, compression)
+CHC_RS_FIELD(chc_prepared_block, n_rows)
+CHC_RS_FIELD(chc_prepared_block, raw_len)
+CHC_RS_FIELD(chc_prepared_block, bytes)
+CHC_RS_FIELD(chc_prepared_block, len)
+CHC_RS_FIELD(chc_prepared_block, cap)
+
 CHC_RS_LAYOUT(chc_client_opts)
 CHC_RS_FIELD(chc_client_opts, client_name)
 CHC_RS_FIELD(chc_client_opts, client_version_major)
