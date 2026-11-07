@@ -8,7 +8,9 @@ use core::ffi::c_int;
 use core::marker::PhantomData;
 use core::pin::Pin;
 
+use crate::alloc::Allocator;
 use crate::block::{BlockOpts, Column};
+use crate::codec::{Codec, Compression};
 use crate::error::{Error, ErrorKind, Result, check};
 use crate::io::Io;
 use crate::sys;
@@ -254,7 +256,116 @@ impl<'a> BlockBuilder<'a> {
     pub(crate) fn as_ptr(&self) -> *const sys::chc_block_builder {
         &self.raw
     }
+
+    /// Serializes this block as a Data packet body once, compressed unless
+    /// `compression` is [`Compression::None`]. Column slabs may drop after
+    /// this returns; the result sends as often as an INSERT retries.
+    ///
+    /// `codec` must support `compression`.
+    pub fn prepare(
+        &self,
+        compression: Compression,
+        codec: Option<Pin<&Codec>>,
+        alloc: Allocator,
+    ) -> Result<PreparedBlock> {
+        PreparedBlock::new(Some(self), compression, codec, alloc)
+    }
 }
+
+/// Data block serialized once, owned without its column slabs.
+///
+/// Send with [`Client::send_prepared`](crate::Client::send_prepared) or the
+/// I/O-independent clients. Connections negotiated with other compression
+/// reject it without writing; rebuild block with matching compression.
+pub struct PreparedBlock {
+    raw: sys::chc_prepared_block,
+    alloc: Allocator,
+}
+
+impl PreparedBlock {
+    /// Empty block that ends INSERT input
+    pub fn end(
+        compression: Compression,
+        codec: Option<Pin<&Codec>>,
+        alloc: Allocator,
+    ) -> Result<Self> {
+        Self::new(None, compression, codec, alloc)
+    }
+
+    fn new(
+        builder: Option<&BlockBuilder<'_>>,
+        compression: Compression,
+        codec: Option<Pin<&Codec>>,
+        alloc: Allocator,
+    ) -> Result<Self> {
+        if compression != Compression::None && !codec.is_some_and(|c| c.supports(compression)) {
+            return Err(usage(format!(
+                "{compression:?} compression requires a codec supporting it"
+            )));
+        }
+        let mut this = Self {
+            raw: sys::chc_prepared_block::zeroed(),
+            alloc,
+        };
+        let bb = builder.map_or(core::ptr::null(), BlockBuilder::as_ptr);
+        let codec = codec.map_or(core::ptr::null(), Codec::as_ptr);
+        let mut err = sys::chc_err::zeroed();
+        let rc = unsafe {
+            sys::chc_block_prepare(
+                bb,
+                compression as sys::chc_compression,
+                codec,
+                this.alloc.as_ptr(),
+                &mut this.raw,
+                &mut err,
+            )
+        };
+        check(rc, &err)?;
+        Ok(this)
+    }
+
+    /// Bytes sent after the Data packet header
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: successful prepare always writes a non-empty body, which C
+        // owns at `bytes` until free
+        unsafe { core::slice::from_raw_parts(self.raw.bytes, self.raw.len) }
+    }
+
+    /// Allocated bytes, at least `as_bytes().len()`
+    pub fn capacity(&self) -> usize {
+        self.raw.cap
+    }
+
+    /// Serialized body bytes before compression
+    pub fn raw_len(&self) -> usize {
+        self.raw.raw_len
+    }
+
+    pub fn n_rows(&self) -> usize {
+        self.raw.n_rows as usize
+    }
+
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const sys::chc_prepared_block {
+        &self.raw
+    }
+
+    /// Copy whose send writes only Data packet header, still checking compression
+    #[cfg(feature = "tokio")]
+    pub(crate) fn header(&self) -> sys::chc_prepared_block {
+        sys::chc_prepared_block { len: 0, ..self.raw }
+    }
+}
+
+impl Drop for PreparedBlock {
+    fn drop(&mut self) {
+        unsafe { sys::chc_prepared_block_free(&mut self.raw, self.alloc.as_ptr()) };
+    }
+}
+
+// Owns plain bytes; C reads them only during a send
+unsafe impl Send for PreparedBlock {}
+unsafe impl Sync for PreparedBlock {}
 
 fn usage(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Usage, message)

@@ -65,7 +65,7 @@ pub use alloc::Allocator;
 #[cfg(feature = "tokio")]
 pub use async_client::{AsyncClient, AsyncTransport, BoxedAsyncClient};
 pub use block::{Block, BlockOpts, BlockReader, Column, ColumnLayout, LowCardinalityView};
-pub use builder::{BlockBuilder, ColumnBuilder};
+pub use builder::{BlockBuilder, ColumnBuilder, PreparedBlock};
 pub use client::{
     Client, ClientOpts, Event, Exception, PacketKind, ProfileInfo, Progress, ServerInfo,
 };

@@ -68,6 +68,15 @@ unsafe extern "C" {
     fn chc_rs_off_chc_codec__lz4_bound() -> usize;
     fn chc_rs_off_chc_codec__zstd_bound() -> usize;
 
+    fn chc_rs_size_chc_prepared_block() -> usize;
+    fn chc_rs_align_chc_prepared_block() -> usize;
+    fn chc_rs_off_chc_prepared_block__compression() -> usize;
+    fn chc_rs_off_chc_prepared_block__n_rows() -> usize;
+    fn chc_rs_off_chc_prepared_block__raw_len() -> usize;
+    fn chc_rs_off_chc_prepared_block__bytes() -> usize;
+    fn chc_rs_off_chc_prepared_block__len() -> usize;
+    fn chc_rs_off_chc_prepared_block__cap() -> usize;
+
     fn chc_rs_size_chc_client_opts() -> usize;
     fn chc_rs_align_chc_client_opts() -> usize;
     fn chc_rs_off_chc_client_opts__client_name() -> usize;
@@ -330,6 +339,45 @@ fn chc_codec_matches_c() {
     );
     field!(sys::chc_codec, lz4_bound, chc_rs_off_chc_codec__lz4_bound);
     field!(sys::chc_codec, zstd_bound, chc_rs_off_chc_codec__zstd_bound);
+}
+
+#[test]
+fn chc_prepared_block_matches_c() {
+    layout!(
+        sys::chc_prepared_block,
+        chc_rs_size_chc_prepared_block,
+        chc_rs_align_chc_prepared_block
+    );
+    field!(
+        sys::chc_prepared_block,
+        compression,
+        chc_rs_off_chc_prepared_block__compression
+    );
+    field!(
+        sys::chc_prepared_block,
+        n_rows,
+        chc_rs_off_chc_prepared_block__n_rows
+    );
+    field!(
+        sys::chc_prepared_block,
+        raw_len,
+        chc_rs_off_chc_prepared_block__raw_len
+    );
+    field!(
+        sys::chc_prepared_block,
+        bytes,
+        chc_rs_off_chc_prepared_block__bytes
+    );
+    field!(
+        sys::chc_prepared_block,
+        len,
+        chc_rs_off_chc_prepared_block__len
+    );
+    field!(
+        sys::chc_prepared_block,
+        cap,
+        chc_rs_off_chc_prepared_block__cap
+    );
 }
 
 #[test]

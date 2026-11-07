@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::alloc::Allocator;
-use crate::builder::BlockBuilder;
+use crate::builder::{BlockBuilder, PreparedBlock};
 use crate::client::{ClientOpts, Event, ServerInfo};
 use crate::codec::Codec;
 use crate::error::{Error, ErrorKind, Result};
@@ -123,6 +123,17 @@ impl<S: AsyncTransport> AsyncClient<S> {
         self.drain_out().await?;
         self.core.send_data(builder)?;
         self.drain_out().await
+    }
+
+    /// Sends a block prepared with [`BlockBuilder::prepare`](crate::BlockBuilder::prepare).
+    pub async fn send_prepared(&mut self, block: &PreparedBlock) -> Result<()> {
+        self.drain_out().await?;
+        // Queue only Data header so body writes without copying into queue
+        self.core.send_prepared_raw(&block.header())?;
+        self.drain_out().await?;
+        self.stream.write_all(block.as_bytes()).await?;
+        self.stream.flush().await?;
+        Ok(())
     }
 
     /// Sends empty Data block that ends INSERT input.
