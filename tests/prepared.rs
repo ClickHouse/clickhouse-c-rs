@@ -66,7 +66,7 @@ fn prepare(first: u64, n: usize, compression: Compression) -> TestResult<Prepare
 }
 
 fn insert(client: &mut Client<'_>, blocks: &[PreparedBlock]) -> TestResult {
-    client.send_query_with("INSERT INTO prepared (id, text) VALUES", &QueryOpts::new())?;
+    client.send_query("INSERT INTO prepared (id, text) VALUES", &QueryOpts::new())?;
     loop {
         match client.recv_event()? {
             Event::Data(_) => break,
@@ -78,7 +78,7 @@ fn insert(client: &mut Client<'_>, blocks: &[PreparedBlock]) -> TestResult {
     for b in blocks {
         client.send_prepared(b)?;
     }
-    client.send_data(None)?;
+    client.send_data_end()?;
     loop {
         match client.recv_event()? {
             Event::EndOfStream => return Ok(()),
@@ -168,15 +168,20 @@ async fn async_prepared_blocks_insert() -> TestResult {
     ];
     let opts = ClientOpts::new().compression(Compression::Lz4);
     let addr = ("127.0.0.1", server.tcp_port);
-    let mut client =
-        clickhouse_c::AsyncClient::connect(addr, opts, codec(Compression::Lz4)).await?;
+    let mut client = clickhouse_c::AsyncClient::connect(
+        addr,
+        &opts,
+        Allocator::stdlib(),
+        codec(Compression::Lz4),
+    )
+    .await?;
     let err = client
         .send_prepared(&prepare(0, 10, Compression::Zstd)?)
         .await
         .expect_err("compression differs");
     assert_eq!(err.kind, ErrorKind::Usage);
     client
-        .send_query("INSERT INTO prepared (id, text) VALUES", None)
+        .send_query("INSERT INTO prepared (id, text) VALUES", &QueryOpts::new())
         .await?;
     while !matches!(client.recv_event().await?, Event::Data(_)) {}
     for b in &blocks {

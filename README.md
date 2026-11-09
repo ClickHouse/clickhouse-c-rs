@@ -20,7 +20,7 @@ uses rustls.
 
 ```toml
 [dependencies]
-clickhouse-c-rs = "0.1"
+clickhouse-c-rs = "0.3"
 ```
 
 Default configuration enables LZ4 compression and requires system liblz4
@@ -29,7 +29,7 @@ compiler and libc:
 
 ```toml
 [dependencies]
-clickhouse-c-rs = { version = "0.1", default-features = false }
+clickhouse-c-rs = { version = "0.3", default-features = false }
 ```
 
 Available features:

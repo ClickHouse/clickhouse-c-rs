@@ -76,8 +76,7 @@ impl<'a> QueryParam<'a> {
     }
 }
 
-/// Additional values sent by
-/// [`Client::send_query_with`](crate::Client::send_query_with).
+/// Additional values sent by [`Client::send_query`](crate::Client::send_query).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QueryOpts<'a> {
     /// Query identifier. `None` lets server assign an identifier.

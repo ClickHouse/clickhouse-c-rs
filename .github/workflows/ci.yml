@@ -56,7 +56,7 @@ jobs:
       # Live tests skip themselves without this, so a run without it would be
       # green and meaningless.
       - name: Install ClickHouse
-        run: curl https://clickhouse.com/ | sh && sudo ./clickhouse install --noninteractive
+        run: curl https://clickhouse.com/ | CLICKHOUSE_ONLY=1 sh && sudo ./clickhouse install --noninteractive
       - run: cargo build ${{ matrix.features }}
       - run: cargo test ${{ matrix.features }}
 
@@ -84,7 +84,7 @@ jobs:
       # Live tests skip themselves without this, which would leave the report
       # green and meaningless.
       - name: Install ClickHouse
-        run: curl https://clickhouse.com/ | sh && sudo ./clickhouse install --noninteractive
+        run: curl https://clickhouse.com/ | CLICKHOUSE_ONLY=1 sh && sudo ./clickhouse install --noninteractive
       - name: Test with coverage
         run: >
           cargo llvm-cov --all-features --all-targets
@@ -163,7 +163,7 @@ jobs:
         with:
           key: asan
       - run: sudo apt-get update && sudo apt-get install -y liblz4-dev libzstd-dev
-      - run: curl https://clickhouse.com/ | sh && sudo ./clickhouse install --noninteractive
+      - run: curl https://clickhouse.com/ | CLICKHOUSE_ONLY=1 sh && sudo ./clickhouse install --noninteractive
       # No TLS: aws-lc-rs ships its own assembly and is not the boundary under
       # test. An explicit --target keeps build scripts uninstrumented.
       - run: >
@@ -184,15 +184,6 @@ jobs:
       # carries every header and C shim the build needs. Extracting and
       # building again outside the repository proves nothing leaks in from the
       # surrounding checkout.
-      - name: UPSTREAM matches the submodule gitlink
-        run: |
-          set -euo pipefail
-          pinned=$(sed -n 's/^revision *= *//p' UPSTREAM)
-          actual=$(git -C clickhouse-c rev-parse HEAD)
-          test "$pinned" = "$actual" \
-            || { echo "UPSTREAM says $pinned, submodule is at $actual"; exit 1; }
-      # Walks the initialized submodule, so this is also what proves the
-      # archive is not missing the headers.
       - run: cargo package --all-features
       - name: Build the extracted archive standalone
         run: |

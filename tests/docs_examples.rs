@@ -57,7 +57,7 @@ fn running_a_query(client: &mut Client<'_>) -> DocResult {
     ];
     let params = [QueryParam::new("cutoff", "'100'")];
 
-    client.send_query_with(
+    client.send_query(
         "SELECT number, toString(number * number) \
          FROM numbers(1000) WHERE number > {cutoff:UInt64}",
         &QueryOpts::new().settings(&settings).params(&params),
@@ -130,7 +130,7 @@ fn print_value(ty: TypeRef<'_>, col: Column<'_>, row: usize) {
 // Data insertion
 
 fn inserting_data(client: &mut Client<'_>) -> DocResult {
-    client.send_query_with(
+    client.send_query(
         "INSERT INTO greetings (id, message) VALUES",
         &QueryOpts::new(),
     )?;
@@ -161,8 +161,8 @@ fn inserting_data(client: &mut Client<'_>) -> DocResult {
     block.append("id", u64_ty.view(), &id)?;
     block.append("message", str_ty.view(), &message)?;
 
-    client.send_data(Some(&block))?; // Send rows
-    client.send_data(None)?; // End INSERT input
+    client.send_data(&block)?; // Send rows
+    client.send_data_end()?; // End INSERT input
 
     loop {
         match client.recv_event()? {
@@ -277,11 +277,16 @@ fn tls_client() -> DocResult {
 async fn async_client() -> DocResult {
     use clickhouse_c::AsyncClient;
 
-    let mut client =
-        AsyncClient::connect(("127.0.0.1", 9000), ClientOpts::new().user("default"), None).await?;
+    let mut client = AsyncClient::connect(
+        ("127.0.0.1", 9000),
+        &ClientOpts::new().user("default"),
+        Allocator::stdlib(),
+        None,
+    )
+    .await?;
 
     client
-        .send_query("SELECT number FROM numbers(5)", None)
+        .send_query("SELECT number FROM numbers(5)", &QueryOpts::new())
         .await?;
     loop {
         match client.recv_event().await? {
@@ -302,14 +307,15 @@ async fn async_client_boxed_transport(secure: bool) -> DocResult {
         AsyncClient::connect_tls(
             ("myhost", 9440),
             "myhost",
-            opts,
+            &opts,
+            Allocator::stdlib(),
             None,
             tls::default_config(),
         )
         .await?
         .boxed()
     } else {
-        AsyncClient::connect(("127.0.0.1", 9000), opts, None)
+        AsyncClient::connect(("127.0.0.1", 9000), &opts, Allocator::stdlib(), None)
             .await?
             .boxed()
     };
@@ -341,7 +347,7 @@ fn ioless_over_a_blocking_socket() -> DocResult {
         pump(&mut core, &mut sock)?;
     }
 
-    core.send_query("SELECT number FROM numbers(5)", None)?;
+    core.send_query("SELECT number FROM numbers(5)", &QueryOpts::new())?;
     loop {
         match core.recv_event()? {
             Step::Ready(Event::EndOfStream) => break,

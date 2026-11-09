@@ -15,7 +15,7 @@
 
 use std::net::TcpStream;
 
-use clickhouse_c::{Allocator, AsyncClient, Client, ClientOpts, Event};
+use clickhouse_c::{Allocator, AsyncClient, Client, ClientOpts, Event, QueryOpts};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -60,7 +60,8 @@ async fn async_tls_live() -> TestResult {
     let mut client = AsyncClient::connect_tls(
         (ep.host.as_str(), ep.port),
         &ep.host,
-        opts(&ep),
+        &opts(&ep),
+        Allocator::stdlib(),
         None,
         clickhouse_c::tls::default_config(),
     )
@@ -72,7 +73,9 @@ async fn async_tls_live() -> TestResult {
         info.name, info.version_major, info.version_minor, info.version_patch
     );
 
-    client.send_query("SELECT toUInt64(42) AS x", None).await?;
+    client
+        .send_query("SELECT toUInt64(42) AS x", &QueryOpts::new())
+        .await?;
     let mut got = None;
     loop {
         match client.recv_event().await? {
@@ -112,7 +115,7 @@ async fn sync_tls_live() -> TestResult {
         info.name, info.version_major, info.version_minor, info.version_patch
     );
 
-    client.send_query("SELECT toUInt64(42) AS x", None)?;
+    client.send_query("SELECT toUInt64(42) AS x", &QueryOpts::new())?;
     let mut got = None;
     loop {
         match client.recv_event()? {

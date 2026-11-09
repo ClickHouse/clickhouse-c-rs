@@ -8,8 +8,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use clickhouse_c::{
-    Allocator, ClientOpts, Compression, Event, IolessClient, PreparedBlock, QuerySetting, Result,
-    Step, TypeAst,
+    Allocator, ClientOpts, Compression, Event, IolessClient, PreparedBlock, QueryOpts,
+    QuerySetting, Result, Step, TypeAst,
 };
 use common::{ChServer, TestResult, clickhouse_on_path};
 
@@ -103,8 +103,13 @@ fn a_hand_written_pump_runs_a_query() -> TestResult {
     let info = core.server_info().expect("handshake completed");
     assert!(!info.name.is_empty());
 
-    core.send_query("SELECT number FROM numbers(2000)", None)?;
+    let settings = [QuerySetting::new("max_block_size", "500")];
+    core.send_query(
+        "SELECT number FROM numbers(2000)",
+        &QueryOpts::new().settings(&settings),
+    )?;
 
+    let mut blocks = 0;
     let mut total_rows = 0usize;
     let mut sum = 0u64;
     loop {
@@ -115,6 +120,7 @@ fn a_hand_written_pump_runs_a_query() -> TestResult {
                 let Some((_, bytes)) = block.column(0).and_then(|c| c.fixed()) else {
                     continue;
                 };
+                blocks += 1;
                 total_rows += block.n_rows();
                 sum += bytes
                     .chunks_exact(8)
@@ -126,6 +132,7 @@ fn a_hand_written_pump_runs_a_query() -> TestResult {
     }
 
     assert_eq!(total_rows, 2000);
+    assert_eq!(blocks, 4, "max_block_size setting reached server");
     assert_eq!(sum, (0..2000u64).sum::<u64>());
     // Small input chunks force parser to resume within block
     assert!(pump.written > 0);
@@ -147,7 +154,7 @@ fn a_hand_written_pump_runs_an_insert() -> TestResult {
     let mut pump = Pump::new(sock, CHUNK);
     drive(&mut core, &mut pump, |c| c.handshake())?;
 
-    core.send_query("INSERT INTO ioless (n) VALUES", None)?;
+    core.send_query("INSERT INTO ioless (n) VALUES", &QueryOpts::new())?;
     // Wait for INSERT structure Data block
     loop {
         match drive(&mut core, &mut pump, |c| c.recv_event())? {
@@ -169,7 +176,7 @@ fn a_hand_written_pump_runs_an_insert() -> TestResult {
     let mut block = clickhouse_c::BlockBuilder::new();
     block.append("n", ty.view(), &col)?;
 
-    core.send_data(Some(&block))?;
+    core.send_data(&block)?;
     core.send_prepared(&PreparedBlock::end(Compression::None, None, alloc)?)?;
     loop {
         match drive(&mut core, &mut pump, |c| c.recv_event())? {
@@ -211,8 +218,6 @@ fn a_fresh_machine_queues_hello_and_waits() {
     let queued = core.pending_out().len();
     core.consume_out(queued * 2);
     assert!(core.pending_out().is_empty());
-
-    let _ = QuerySetting::TEXT_TYPE_NAMES; // I/O-independent API does not support settings
 }
 
 /// Step answers both questions a pump asks of it.

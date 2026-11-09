@@ -161,9 +161,10 @@ impl Block {
         unsafe { sys::chc_block_is_overflows(self.raw.as_ptr().cast_const()) }
     }
 
-    /// Returns two-level aggregation bucket, or -1 when not applicable.
-    pub fn bucket_num(&self) -> i32 {
-        unsafe { sys::chc_block_bucket_num(self.raw.as_ptr().cast_const()) }
+    /// Returns two-level aggregation bucket.
+    pub fn bucket_num(&self) -> Option<u32> {
+        let n = unsafe { sys::chc_block_bucket_num(self.raw.as_ptr().cast_const()) };
+        u32::try_from(n).ok()
     }
 }
 

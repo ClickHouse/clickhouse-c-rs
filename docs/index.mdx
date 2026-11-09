@@ -43,7 +43,7 @@ application:
 
 ```toml
 [dependencies]
-clickhouse-c-rs = "0.1"
+clickhouse-c-rs = "0.3"
 ```
 
 Unix only: `PosixIo` is the bundled transport and it needs `poll(2)`. The MSRV
@@ -71,9 +71,6 @@ The crate is organized in three layers:
 3. Optional transport adapters — `PosixIo`, `AsyncClient`, `tls::TlsIo`. The
    blocking ones sit on the `Io` trait; the async one is a byte pump over
    `IolessClient`, which is the protocol with no I/O in it.
-
-`clickhouse_c::UPSTREAM_REVISION` reports which `clickhouse-c` revision the
-bundled headers came from.
 
 ## Required server setting {#server-setting}
 
@@ -130,9 +127,9 @@ features it gates.
 
 ## Running a query {#running-a-query}
 
-Send the query, then drain events until `Event::EndOfStream`. Use
-`send_query_with` to attach settings and parameters; `send_query` is the bare
-form that sends an empty settings list.
+Send the query, then drain events until `Event::EndOfStream`. `QueryOpts`
+carries query id, settings, and parameters; `QueryOpts::new()` sends none.
+`Client`, `AsyncClient`, and `IolessClient` share this `send_query`.
 
 ```rust
 use clickhouse_c::{Event, QueryOpts, QueryParam, QuerySetting};
@@ -146,7 +143,7 @@ let settings = [
 ];
 let params = [QueryParam::new("cutoff", "'100'")];
 
-client.send_query_with(
+client.send_query(
     "SELECT number, toString(number * number) \
      FROM numbers(1000) WHERE number > {cutoff:UInt64}",
     &QueryOpts::new().settings(&settings).params(&params),
@@ -270,7 +267,7 @@ more data blocks, then sends an empty block to terminate the stream.
 ```rust
 use clickhouse_c::{BlockBuilder, ColumnBuilder, Event, QueryOpts, TypeAst};
 
-client.send_query_with("INSERT INTO greetings (id, message) VALUES", &QueryOpts::new())?;
+client.send_query("INSERT INTO greetings (id, message) VALUES", &QueryOpts::new())?;
 
 // Wait for the header block: schema, zero rows.
 loop {
@@ -298,8 +295,8 @@ let mut block = BlockBuilder::new();
 block.append("id", u64_ty.view(), &id)?;
 block.append("message", str_ty.view(), &message)?;
 
-client.send_data(Some(&block))?;   // the populated block
-client.send_data(None)?;           // empty block ends the INSERT
+client.send_data(&block)?; // populated block
+client.send_data_end()?;    // empty block ends INSERT
 
 loop {
     match client.recv_event()? {
@@ -470,15 +467,16 @@ submits inbound bytes and drains outbound ones. Its method futures are `Send`,
 so `tokio::spawn` on a multi-thread runtime accepts them.
 
 ```rust
-use clickhouse_c::{AsyncClient, ClientOpts, Event};
+use clickhouse_c::{Allocator, AsyncClient, ClientOpts, Event, QueryOpts};
 
 let mut client = AsyncClient::connect(
     ("127.0.0.1", 9000),
-    ClientOpts::new().user("default"),
+    &ClientOpts::new().user("default"),
+    Allocator::stdlib(),
     None,
 ).await?;
 
-client.send_query("SELECT number FROM numbers(5)", None).await?;
+client.send_query("SELECT number FROM numbers(5)", &QueryOpts::new()).await?;
 loop {
     match client.recv_event().await? {
         Event::Data(block) => print_block(&block),
@@ -497,15 +495,16 @@ connection are two types. `boxed()` erases it into `BoxedAsyncClient`, which
 is what a struct field, a pool, or a reconnect assignment wants:
 
 ```rust
-use clickhouse_c::{AsyncClient, BoxedAsyncClient, ClientOpts, tls};
+use clickhouse_c::{Allocator, AsyncClient, BoxedAsyncClient, ClientOpts, tls};
 
 let opts = ClientOpts::new().user("default").password("…");
+let alloc = Allocator::stdlib();
 let mut client: BoxedAsyncClient = if secure {
-    AsyncClient::connect_tls(("myhost", 9440), "myhost", opts, None, tls::default_config())
+    AsyncClient::connect_tls(("myhost", 9440), "myhost", &opts, alloc, None, tls::default_config())
         .await?
         .boxed()
 } else {
-    AsyncClient::connect(("127.0.0.1", 9000), opts, None).await?.boxed()
+    AsyncClient::connect(("127.0.0.1", 9000), &opts, alloc, None).await?.boxed()
 };
 ```
 
@@ -514,13 +513,6 @@ protocol work and the method futures are untouched. Any `AsyncRead +
 AsyncWrite + Unpin + Send` stream is an `AsyncTransport`, so
 `AsyncClient::handshake_on` accepts a `Box<dyn AsyncTransport>` as readily as
 a `TcpStream`.
-
-<Note>
-`clickhouse-c` publishes no `chc_async_send_query_ex`, so the async client has
-no counterpart to `send_query_with`: per-query settings and parameters are
-reachable from the blocking client only. Put required settings in the SQL text
-or on the server profile until upstream adds one.
-</Note>
 
 ## Any other runtime {#ioless}
 
@@ -533,7 +525,7 @@ Every step that could run past the submitted bytes returns `Step::NeedsInput`
 instead of blocking, and resumes mid-block once more arrive.
 
 ```rust
-use clickhouse_c::{Allocator, ClientOpts, Event, IolessClient, Step};
+use clickhouse_c::{Allocator, ClientOpts, Event, IolessClient, QueryOpts, Step};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -557,7 +549,7 @@ while !core.handshake()?.is_ready() {
     pump(&mut core, &mut sock)?;
 }
 
-core.send_query("SELECT number FROM numbers(5)", None)?;
+core.send_query("SELECT number FROM numbers(5)", &QueryOpts::new())?;
 loop {
     match core.recv_event()? {
         Step::Ready(Event::EndOfStream) => break,
