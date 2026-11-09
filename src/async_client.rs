@@ -11,6 +11,7 @@ use crate::client::{ClientOpts, Event, ServerInfo};
 use crate::codec::Codec;
 use crate::error::{Error, ErrorKind, Result};
 use crate::ioless::{IolessClient, Step};
+use crate::query::QueryOpts;
 
 const DEFAULT_READ_BUF_BYTES: usize = 8 * 1024;
 
@@ -45,7 +46,8 @@ impl AsyncClient<TcpStream> {
     /// Socket uses `TCP_NODELAY`.
     pub async fn connect<A>(
         addr: A,
-        opts: ClientOpts,
+        opts: &ClientOpts,
+        alloc: Allocator,
         codec: Option<Pin<Box<Codec>>>,
     ) -> Result<Self>
     where
@@ -53,7 +55,7 @@ impl AsyncClient<TcpStream> {
     {
         let sock = TcpStream::connect(addr).await?;
         sock.set_nodelay(true).ok();
-        Self::handshake_on(sock, opts, codec).await
+        Self::handshake_on(sock, opts, alloc, codec).await
     }
 }
 
@@ -67,7 +69,8 @@ impl AsyncClient<tokio_rustls::client::TlsStream<TcpStream>> {
     pub async fn connect_tls<A>(
         addr: A,
         domain: &str,
-        opts: ClientOpts,
+        opts: &ClientOpts,
+        alloc: Allocator,
         codec: Option<Pin<Box<Codec>>>,
         config: std::sync::Arc<rustls::ClientConfig>,
     ) -> Result<Self>
@@ -87,7 +90,7 @@ impl AsyncClient<tokio_rustls::client::TlsStream<TcpStream>> {
             .connect(server_name, sock)
             .await
             .map_err(|e| Error::new(ErrorKind::Io, format!("TLS handshake: {e}")))?;
-        Self::handshake_on(tls, opts, codec).await
+        Self::handshake_on(tls, opts, alloc, codec).await
     }
 }
 
@@ -95,7 +98,8 @@ impl<S: AsyncTransport> AsyncClient<S> {
     /// Completes Hello handshake over an existing transport.
     pub async fn handshake_on(
         stream: S,
-        opts: ClientOpts,
+        opts: &ClientOpts,
+        alloc: Allocator,
         codec: Option<Pin<Box<Codec>>>,
     ) -> Result<Self> {
         let read_buf_bytes = if opts.read_buffer_bytes == 0 {
@@ -104,7 +108,7 @@ impl<S: AsyncTransport> AsyncClient<S> {
             opts.read_buffer_bytes
         };
         let mut client = Self {
-            core: IolessClient::new(&opts, Allocator::stdlib(), codec)?,
+            core: IolessClient::new(opts, alloc, codec)?,
             stream,
             read_buf: vec![0; read_buf_bytes],
         };
@@ -112,14 +116,15 @@ impl<S: AsyncTransport> AsyncClient<S> {
         Ok(client)
     }
 
-    pub async fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
+    /// Sends a query, see [`Client::send_query`](crate::Client::send_query).
+    pub async fn send_query(&mut self, sql: &str, opts: &QueryOpts<'_>) -> Result<()> {
         self.drain_out().await?;
-        self.core.send_query(sql, query_id)?;
+        self.core.send_query(sql, opts)?;
         self.drain_out().await
     }
 
-    /// Sends a Data block, or empty terminator when `builder` is `None`.
-    pub async fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
+    /// Sends a Data block.
+    pub async fn send_data(&mut self, builder: &BlockBuilder<'_>) -> Result<()> {
         self.drain_out().await?;
         self.core.send_data(builder)?;
         self.drain_out().await

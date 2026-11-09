@@ -253,9 +253,10 @@ impl<'a> TypeRef<'a> {
         }
     }
 
-    /// Returns `N` for `FixedString(N)`, or zero for other types.
-    pub fn fixed_size(&self) -> i32 {
-        unsafe { sys::chc_type_fixed_size(self.raw) }
+    /// Returns `N` for `FixedString(N)`.
+    pub fn fixed_size(&self) -> Option<usize> {
+        (self.kind() == Some(Kind::FixedString))
+            .then(|| unsafe { sys::chc_type_fixed_size(self.raw) } as usize)
     }
 
     /// Returns byte width in a [`Fixed`](crate::ColumnLayout::Fixed) column.
@@ -264,20 +265,29 @@ impl<'a> TypeRef<'a> {
         unsafe { sys::chc_type_elem_size(self.raw) }
     }
 
-    /// Returns `P` for `Decimal(P, S)`, or zero for other types.
-    pub fn decimal_precision(&self) -> i32 {
-        unsafe { sys::chc_type_decimal_precision(self.raw) }
+    /// Returns `P` for `Decimal(P, S)`.
+    pub fn decimal_precision(&self) -> Option<u32> {
+        self.is_decimal()
+            .then(|| unsafe { sys::chc_type_decimal_precision(self.raw) } as u32)
     }
 
-    /// Returns `S` for `Decimal(P, S)`, or zero for other types.
-    pub fn decimal_scale(&self) -> i32 {
-        unsafe { sys::chc_type_decimal_scale(self.raw) }
+    /// Returns `S` for `Decimal(P, S)`.
+    pub fn decimal_scale(&self) -> Option<u32> {
+        self.is_decimal()
+            .then(|| unsafe { sys::chc_type_decimal_scale(self.raw) } as u32)
     }
 
     /// Returns subsecond precision for `DateTime64(S)` or `Time64(S)`.
-    /// Returns zero for other types.
-    pub fn datetime64_scale(&self) -> i32 {
-        unsafe { sys::chc_type_datetime64_scale(self.raw) }
+    pub fn datetime64_scale(&self) -> Option<u32> {
+        matches!(self.kind(), Some(Kind::DateTime64 | Kind::Time64))
+            .then(|| unsafe { sys::chc_type_datetime64_scale(self.raw) } as u32)
+    }
+
+    fn is_decimal(&self) -> bool {
+        matches!(
+            self.kind(),
+            Some(Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256)
+        )
     }
 
     /// Returns unit for an `Interval*` type, or None for other types.
@@ -522,28 +532,30 @@ mod tests {
     fn fixed_string_reports_its_width() {
         let ty = parse("FixedString(12)");
         assert_eq!(ty.view().kind(), Some(Kind::FixedString));
-        assert_eq!(ty.view().fixed_size(), 12);
+        assert_eq!(ty.view().fixed_size(), Some(12));
         assert_eq!(ty.view().elem_size(), 12);
-        assert_eq!(parse("UInt32").view().fixed_size(), 0);
+        assert_eq!(parse("UInt32").view().fixed_size(), None);
     }
 
     #[test]
     fn decimal_carries_precision_and_scale() {
         let ty = parse("Decimal(18, 4)");
         assert_eq!(ty.view().kind(), Some(Kind::Decimal64));
-        assert_eq!(ty.view().decimal_precision(), 18);
-        assert_eq!(ty.view().decimal_scale(), 4);
+        assert_eq!(ty.view().decimal_precision(), Some(18));
+        assert_eq!(ty.view().decimal_scale(), Some(4));
+        assert_eq!(parse("Decimal(10, 0)").view().decimal_scale(), Some(0));
 
         let plain = parse("String");
-        assert_eq!(plain.view().decimal_precision(), 0);
-        assert_eq!(plain.view().decimal_scale(), 0);
+        assert_eq!(plain.view().decimal_precision(), None);
+        assert_eq!(plain.view().decimal_scale(), None);
     }
 
     #[test]
     fn subsecond_scale_comes_from_the_type() {
-        assert_eq!(parse("DateTime64(9)").view().datetime64_scale(), 9);
-        assert_eq!(parse("Time64(3)").view().datetime64_scale(), 3);
-        assert_eq!(parse("DateTime").view().datetime64_scale(), 0);
+        assert_eq!(parse("DateTime64(9)").view().datetime64_scale(), Some(9));
+        assert_eq!(parse("Time64(3)").view().datetime64_scale(), Some(3));
+        assert_eq!(parse("DateTime64(0)").view().datetime64_scale(), Some(0));
+        assert_eq!(parse("DateTime").view().datetime64_scale(), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "clickhouse-c-rs"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust bindings for clickhouse-c, the header-only C client for the ClickHouse Native wire format"
@@ -16,9 +16,7 @@ include = [
     "/build.rs",
     "/Cargo.toml",
     "/LICENSE",
-    "/CHANGELOG.md",
     "/README.md",
-    "/UPSTREAM",
     "/clickhouse-c/LICENSE",
     "/clickhouse-c/*.h",
     "/examples/*.rs",

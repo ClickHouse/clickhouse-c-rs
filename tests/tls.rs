@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use clickhouse_c::tls::{self, rustls};
-use clickhouse_c::{Allocator, AsyncClient, Client, ClientOpts, ErrorKind, Event};
+use clickhouse_c::{Allocator, AsyncClient, Client, ClientOpts, ErrorKind, Event, QueryOpts};
 use common::{ChServer, TestResult, clickhouse_on_path};
 
 fn openssl_on_path() -> bool {
@@ -175,14 +175,17 @@ async fn async_tls_roundtrip() -> TestResult {
     let mut client = AsyncClient::connect_tls(
         ("127.0.0.1", server.secure_port()),
         "localhost",
-        ClientOpts::new(),
+        &ClientOpts::new(),
+        Allocator::stdlib(),
         None,
         config,
     )
     .await?;
     assert!(client.server_info().is_some());
 
-    client.send_query("SELECT toUInt64(42) AS x", None).await?;
+    client
+        .send_query("SELECT toUInt64(42) AS x", &QueryOpts::new())
+        .await?;
     let mut got = None;
     loop {
         match client.recv_event().await? {
@@ -216,7 +219,7 @@ async fn sync_tls_roundtrip() -> TestResult {
     let mut client = Client::init(&ClientOpts::new(), Allocator::stdlib(), io, None)?;
     assert!(client.server_info().is_some());
 
-    client.send_query("SELECT toUInt64(42) AS x", None)?;
+    client.send_query("SELECT toUInt64(42) AS x", &QueryOpts::new())?;
     let mut got = None;
     loop {
         match client.recv_event()? {
@@ -252,7 +255,8 @@ async fn an_unparsable_server_name_is_a_usage_error() -> TestResult {
     let Err(err) = AsyncClient::connect_tls(
         ("127.0.0.1", port),
         "not a hostname",
-        ClientOpts::new(),
+        &ClientOpts::new(),
+        Allocator::stdlib(),
         None,
         tls::default_config(),
     )
@@ -330,7 +334,7 @@ fn a_write_to_a_dead_peer_is_an_error() -> TestResult {
     // reset arrives
     let big = "x".repeat(64 * 1024);
     for _ in 0..64 {
-        if let Err(err) = client.send_query(&format!("SELECT '{big}'"), None) {
+        if let Err(err) = client.send_query(&format!("SELECT '{big}'"), &QueryOpts::new()) {
             assert_eq!(err.kind, ErrorKind::Io);
             assert!(err.message.contains("tls write"), "{err}");
             return Ok(());
@@ -351,7 +355,8 @@ fn plaintext_and_tls_share_one_type(
     require_send(AsyncClient::connect_tls(
         ("h", 1u16),
         "h",
-        ClientOpts::new(),
+        &ClientOpts::new(),
+        Allocator::stdlib(),
         None,
         tls::default_config(),
     ));

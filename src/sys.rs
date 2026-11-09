@@ -739,6 +739,13 @@ unsafe extern "C" {
         query_id_len: usize,
         err: *mut chc_err,
     ) -> c_int;
+    pub fn chc_async_send_query_ex(
+        c: *mut chc_async_client,
+        sql: *const c_char,
+        sql_len: usize,
+        opts: *const chc_query_opts,
+        err: *mut chc_err,
+    ) -> c_int;
     pub fn chc_async_send_data(
         c: *mut chc_async_client,
         bb: *const chc_block_builder,

@@ -28,8 +28,6 @@ fn main() {
         );
     }
 
-    emit_upstream_revision(&manifest);
-
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     generate_constants(&chc_dir, &out_dir);
     generate_parity_inventory(&chc_dir, &manifest, &out_dir);
@@ -95,21 +93,6 @@ fn probe(pkg: &str, link_name: &str) -> Vec<PathBuf> {
             Vec::new()
         }
     }
-}
-
-/// Exports bundled clickhouse-c revision from `UPSTREAM` to Rust compilation.
-fn emit_upstream_revision(manifest: &Path) {
-    let path = manifest.join("UPSTREAM");
-    let revision = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == "revision"))
-                .map(|(_, v)| v.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=CHC_UPSTREAM_REVISION={revision}");
-    println!("cargo:rerun-if-changed={}", path.display());
 }
 
 /* Generate constants from C headers */

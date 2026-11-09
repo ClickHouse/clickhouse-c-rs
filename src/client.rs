@@ -271,31 +271,11 @@ impl<'fd> Client<'fd> {
         self.io.as_mut().set_read_timeout(timeout)
     }
 
-    /// Sends a query without settings or parameters.
-    ///
-    /// Server profile supplies all query settings. Use
-    /// [`QuerySetting::TEXT_TYPE_NAMES`](crate::QuerySetting::TEXT_TYPE_NAMES)
-    /// with [`send_query_with`](Self::send_query_with) when profile may enable
-    /// binary type names.
-    pub fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
-        let (qid, qid_len) = query_id
-            .map(|q| (q.as_ptr().cast::<c_char>(), q.len()))
-            .unwrap_or((core::ptr::null(), 0));
-        let mut err = sys::chc_err::zeroed();
-        let rc = unsafe {
-            sys::chc_client_send_query(
-                self.raw.as_ptr(),
-                sql.as_ptr().cast::<c_char>(),
-                sql.len(),
-                qid,
-                qid_len,
-                &mut err,
-            )
-        };
-        check(rc, &err)
-    }
-
     /// Sends a query with settings and `{name:Type}` parameters.
+    ///
+    /// Settings absent from `opts` come from server profile. Use
+    /// [`QuerySetting::TEXT_TYPE_NAMES`](crate::QuerySetting::TEXT_TYPE_NAMES)
+    /// when profile may enable binary type names.
     ///
     /// ```no_run
     /// use clickhouse_c::{QueryOpts, QueryParam, QuerySetting};
@@ -305,14 +285,14 @@ impl<'fd> Client<'fd> {
     ///     QuerySetting::new("max_block_size", "8192"),
     /// ];
     /// let params = [QueryParam::new("cutoff", "'100'")];
-    /// client.send_query_with(
+    /// client.send_query(
     ///     "SELECT number FROM numbers(1000) WHERE number > {cutoff:UInt64}",
     ///     &QueryOpts::new().settings(&settings).params(&params),
     /// )?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_query_with(&mut self, sql: &str, opts: &QueryOpts<'_>) -> Result<()> {
+    pub fn send_query(&mut self, sql: &str, opts: &QueryOpts<'_>) -> Result<()> {
         let raw_opts = RawQueryOpts::new(opts)?;
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
@@ -328,12 +308,18 @@ impl<'fd> Client<'fd> {
     }
 
     /// Sends a Data block.
-    ///
-    /// `None` sends empty block that ends INSERT input.
-    pub fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
-        let bb_ptr = builder.map(|b| b.as_ptr()).unwrap_or(core::ptr::null());
+    pub fn send_data(&mut self, builder: &BlockBuilder<'_>) -> Result<()> {
+        self.send_data_raw(builder.as_ptr())
+    }
+
+    /// Sends empty Data block that ends INSERT input.
+    pub fn send_data_end(&mut self) -> Result<()> {
+        self.send_data_raw(core::ptr::null())
+    }
+
+    fn send_data_raw(&mut self, bb: *const sys::chc_block_builder) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
-        let rc = unsafe { sys::chc_client_send_data(self.raw.as_ptr(), bb_ptr, &mut err) };
+        let rc = unsafe { sys::chc_client_send_data(self.raw.as_ptr(), bb, &mut err) };
         check(rc, &err)
     }
 
@@ -503,7 +489,7 @@ fn cstr_bytes<'a>(ptr: *mut c_char, len: usize) -> &'a [u8] {
 /// Hello packets are handled during [`Client::init`] and do not have a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
-pub enum PacketKind {
+pub(crate) enum PacketKind {
     Data = sys::CHC_PKT_DATA,
     Exception = sys::CHC_PKT_EXCEPTION,
     Progress = sys::CHC_PKT_PROGRESS,

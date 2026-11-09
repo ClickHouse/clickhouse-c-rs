@@ -32,6 +32,8 @@ use crate::types::TypeRef;
 pub struct ColumnBuilder<'a> {
     // Wrapper variants contain pointers to borrowed child nodes
     node: sys::chc_column,
+    // Tuple node points into this heap allocation, stable across moves
+    _children: Box<[*mut sys::chc_column]>,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -98,7 +100,7 @@ impl<'a> ColumnBuilder<'a> {
     /// for null rows.
     pub fn low_cardinality<'r>(
         &'r self,
-        key_size: i32,
+        key_size: usize,
         keys: &'r [u8],
         n_rows: usize,
     ) -> Result<ColumnBuilder<'r>> {
@@ -111,24 +113,13 @@ impl<'a> ColumnBuilder<'a> {
 
     /// Creates a tuple column from `children`.
     ///
-    /// All children must have same row count. `ptrs` provides temporary
-    /// pointer storage and must have same length as `children`. Returned
-    /// builder borrows both slices. Maps, nested values, and geographic
-    /// types use tuple storage internally.
-    pub fn tuple<'r>(
-        children: &'r [ColumnBuilder<'a>],
-        ptrs: &'r mut [*mut sys::chc_column],
-    ) -> Result<ColumnBuilder<'r>> {
+    /// All children must have same row count. Returned builder borrows
+    /// `children`. Maps, nested values, and geographic types use tuple
+    /// storage internally.
+    pub fn tuple<'r>(children: &'r [ColumnBuilder<'a>]) -> Result<ColumnBuilder<'r>> {
         let Some(first) = children.first() else {
             return Err(usage("tuple column: needs at least one child"));
         };
-        if ptrs.len() != children.len() {
-            return Err(usage(format!(
-                "tuple ptr scratch length mismatch: {} vs {} children",
-                ptrs.len(),
-                children.len()
-            )));
-        }
         let n_rows = first.n_rows();
         for (i, child) in children.iter().enumerate() {
             if child.n_rows() != n_rows {
@@ -137,11 +128,14 @@ impl<'a> ColumnBuilder<'a> {
                     child.n_rows()
                 )));
             }
-            ptrs[i] = child.node_ptr().cast_mut();
         }
-        Ok(node(unsafe {
-            sys::chc_build_tuple(ptrs.as_mut_ptr(), children.len())
-        }))
+        let mut ptrs: Box<[_]> = children.iter().map(|c| c.node_ptr().cast_mut()).collect();
+        let node = unsafe { sys::chc_build_tuple(ptrs.as_mut_ptr(), ptrs.len()) };
+        Ok(ColumnBuilder {
+            node,
+            _children: ptrs,
+            _marker: PhantomData,
+        })
     }
 
     /// Returns row count for this column.
@@ -158,6 +152,7 @@ impl<'a> ColumnBuilder<'a> {
 fn node<'x>(node: sys::chc_column) -> ColumnBuilder<'x> {
     ColumnBuilder {
         node,
+        _children: Box::default(),
         _marker: PhantomData,
     }
 }
@@ -422,7 +417,7 @@ fn validate_string(offsets: &[u64], data_len: usize, n_rows: usize, label: &str)
 
 fn validate_low_cardinality_keys(
     keys: &[u8],
-    key_size: i32,
+    key_size: usize,
     n_rows: usize,
     dict_n: usize,
 ) -> Result<()> {
@@ -437,7 +432,6 @@ fn validate_low_cardinality_keys(
             )));
         }
     };
-    let key_size = key_size as usize;
     require_len(
         "LowCardinality keys",
         keys.len(),
@@ -465,7 +459,6 @@ unsafe impl Sync for BlockBuilder<'_> {}
 #[cfg(test)]
 mod tests {
     use super::{BlockBuilder, ColumnBuilder};
-    use crate::sys;
     use crate::{Allocator, ErrorKind, TypeAst};
 
     fn kind(result: crate::Result<ColumnBuilder<'_>>) -> ErrorKind {
@@ -487,33 +480,21 @@ mod tests {
     }
 
     #[test]
-    fn a_tuple_needs_children_and_matching_scratch() {
-        let mut ptrs: [*mut sys::chc_column; 1] = [core::ptr::null_mut()];
-        assert_eq!(kind(ColumnBuilder::tuple(&[], &mut ptrs)), ErrorKind::Usage);
-
-        let one = ColumnBuilder::fixed(&[0; 4], 4, 1).expect("fixed");
-        let two = ColumnBuilder::fixed(&[0; 8], 4, 2).expect("fixed");
-        assert_eq!(
-            kind(ColumnBuilder::tuple(&[one, two], &mut ptrs)),
-            ErrorKind::Usage,
-        );
+    fn a_tuple_needs_children() {
+        assert_eq!(kind(ColumnBuilder::tuple(&[])), ErrorKind::Usage);
     }
 
     #[test]
     fn tuple_children_must_agree_on_row_count() {
         let one = ColumnBuilder::fixed(&[0; 4], 4, 1).expect("fixed");
         let two = ColumnBuilder::fixed(&[0; 8], 4, 2).expect("fixed");
-        let mut ptrs: [*mut sys::chc_column; 2] = [core::ptr::null_mut(); 2];
-        assert_eq!(
-            kind(ColumnBuilder::tuple(&[one, two], &mut ptrs)),
-            ErrorKind::Usage,
-        );
+        assert_eq!(kind(ColumnBuilder::tuple(&[one, two])), ErrorKind::Usage);
     }
 
     #[test]
     fn low_cardinality_keys_must_use_a_wire_width() {
         let dict = ColumnBuilder::string(&[0], &[], 1).expect("dict");
-        for bad in [0, 3, 16, -1] {
+        for bad in [0, 3, 16, usize::MAX] {
             assert_eq!(
                 kind(dict.low_cardinality(bad, &[0; 8], 1)),
                 ErrorKind::Usage,

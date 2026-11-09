@@ -9,14 +9,20 @@ use core::task::{Context, Poll};
 use std::io;
 
 use clickhouse_c::{
-    AsyncClient, AsyncTransport, Block, BlockBuilder, BoxedAsyncClient, ClientOpts, ColumnBuilder,
-    ErrorKind, Event, TypeAst,
+    Allocator, AsyncClient, AsyncTransport, Block, BlockBuilder, BoxedAsyncClient, ClientOpts,
+    ColumnBuilder, ErrorKind, Event, QueryOpts, TypeAst,
 };
 use common::{ChServer, TestResult, clickhouse_on_path};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 async fn connect(server: &ChServer) -> clickhouse_c::Result<AsyncClient> {
-    AsyncClient::connect(("127.0.0.1", server.tcp_port), ClientOpts::new(), None).await
+    AsyncClient::connect(
+        ("127.0.0.1", server.tcp_port),
+        &ClientOpts::new(),
+        Allocator::stdlib(),
+        None,
+    )
+    .await
 }
 
 async fn drain<S: AsyncTransport>(client: &mut AsyncClient<S>) -> TestResult {
@@ -43,19 +49,22 @@ async fn async_insert_select_roundtrip() -> TestResult {
     client
         .send_query(
             "CREATE TABLE async_roundtrip (id Int32, name String) ENGINE = Memory",
-            None,
+            &QueryOpts::new(),
         )
         .await?;
     drain(&mut client).await?;
 
     client
-        .send_query("INSERT INTO async_roundtrip FORMAT Native", None)
+        .send_query(
+            "INSERT INTO async_roundtrip FORMAT Native",
+            &QueryOpts::new(),
+        )
         .await?;
     let ids = [10i32, 20, 30];
     let id_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
     let names = ["alpha", "beta", "gamma"];
     let (name_offsets, name_data) = string_column(&names);
-    let alloc = clickhouse_c::Allocator::stdlib();
+    let alloc = Allocator::stdlib();
     let id_type = TypeAst::parse("Int32", alloc)?;
     let name_type = TypeAst::parse("String", alloc)?;
     let id_col = ColumnBuilder::fixed(&id_bytes, id_type.view().elem_size(), ids.len())?;
@@ -63,12 +72,15 @@ async fn async_insert_select_roundtrip() -> TestResult {
     let mut block = BlockBuilder::new();
     block.append("id", id_type.view(), &id_col)?;
     block.append("name", name_type.view(), &name_col)?;
-    client.send_data(Some(&block)).await?;
+    client.send_data(&block).await?;
     client.send_data_end().await?;
     drain(&mut client).await?;
 
     client
-        .send_query("SELECT id, name FROM async_roundtrip ORDER BY id", None)
+        .send_query(
+            "SELECT id, name FROM async_roundtrip ORDER BY id",
+            &QueryOpts::new(),
+        )
         .await?;
     let mut rows = Vec::new();
     loop {
@@ -102,7 +114,10 @@ async fn async_bad_sql_returns_exception() -> TestResult {
     let server = ChServer::spawn()?;
     let mut client = connect(&server).await?;
     client
-        .send_query("SELECT * FROM definitely_missing_async_table", None)
+        .send_query(
+            "SELECT * FROM definitely_missing_async_table",
+            &QueryOpts::new(),
+        )
         .await?;
 
     loop {
@@ -129,7 +144,7 @@ async fn async_boxed_client_runs_query() -> TestResult {
     let server = ChServer::spawn()?;
     let mut client: BoxedAsyncClient = connect(&server).await?.boxed();
     assert!(client.server_info().is_some());
-    client.send_query("SELECT 1", None).await?;
+    client.send_query("SELECT 1", &QueryOpts::new()).await?;
     drain(&mut client).await?;
 
     Ok(())
@@ -248,7 +263,10 @@ impl AsyncWrite for StalledWriter {
 /// as an endless pump.
 #[tokio::test(flavor = "current_thread")]
 async fn a_closed_transport_ends_the_handshake() {
-    let Err(err) = AsyncClient::handshake_on(ClosedReader, ClientOpts::new(), None).await else {
+    let Err(err) =
+        AsyncClient::handshake_on(ClosedReader, &ClientOpts::new(), Allocator::stdlib(), None)
+            .await
+    else {
         panic!("handshake completed without a server");
     };
     assert_eq!(err.kind, ErrorKind::Eof);
@@ -258,7 +276,10 @@ async fn a_closed_transport_ends_the_handshake() {
 /// output queue that never drains.
 #[tokio::test(flavor = "current_thread")]
 async fn a_transport_that_writes_nothing_is_an_error() {
-    let Err(err) = AsyncClient::handshake_on(StalledWriter, ClientOpts::new(), None).await else {
+    let Err(err) =
+        AsyncClient::handshake_on(StalledWriter, &ClientOpts::new(), Allocator::stdlib(), None)
+            .await
+    else {
         panic!("handshake completed without a server");
     };
     assert_eq!(err.kind, ErrorKind::Io);
@@ -276,11 +297,17 @@ async fn a_custom_read_buffer_size_is_honoured() -> TestResult {
     let server = ChServer::spawn()?;
     let mut opts = ClientOpts::new();
     opts.read_buffer_bytes = 64;
-    let mut client = AsyncClient::connect(("127.0.0.1", server.tcp_port), opts, None).await?;
+    let mut client = AsyncClient::connect(
+        ("127.0.0.1", server.tcp_port),
+        &opts,
+        Allocator::stdlib(),
+        None,
+    )
+    .await?;
 
     // Small buffer forces several reads for one result
     client
-        .send_query("SELECT number FROM numbers(4096)", None)
+        .send_query("SELECT number FROM numbers(4096)", &QueryOpts::new())
         .await?;
     drain(&mut client).await?;
     Ok(())
@@ -306,9 +333,14 @@ async fn the_protocol_core_is_reachable() -> TestResult {
 #[allow(dead_code)]
 fn method_futures_are_send(mut c: AsyncClient, bb: BlockBuilder<'static>) {
     fn require_send<T: Send>(_: T) {}
-    require_send(AsyncClient::connect(("h", 1u16), ClientOpts::new(), None));
-    require_send(c.send_query("", None));
-    require_send(c.send_data(Some(&bb)));
+    require_send(AsyncClient::connect(
+        ("h", 1u16),
+        &ClientOpts::new(),
+        Allocator::stdlib(),
+        None,
+    ));
+    require_send(c.send_query("", &QueryOpts::new()));
+    require_send(c.send_data(&bb));
     require_send(c.send_data_end());
     require_send(c.recv_event());
 }
@@ -317,5 +349,10 @@ fn method_futures_are_send(mut c: AsyncClient, bb: BlockBuilder<'static>) {
 #[allow(dead_code)]
 fn any_tokio_transport_works(pipe: tokio::io::DuplexStream) {
     fn require_send<T: Send>(_: T) {}
-    require_send(AsyncClient::handshake_on(pipe, ClientOpts::new(), None));
+    require_send(AsyncClient::handshake_on(
+        pipe,
+        &ClientOpts::new(),
+        Allocator::stdlib(),
+        None,
+    ));
 }

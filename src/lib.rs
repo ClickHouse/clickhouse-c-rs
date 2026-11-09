@@ -20,9 +20,8 @@
 //!
 //! # Safety model
 //!
-//! Safe API depends on invariants documented by bundled clickhouse-c revision,
-//! available as [`UPSTREAM_REVISION`]. Slice lengths are bounded by owning C
-//! values.
+//! Safe API depends on invariants documented by bundled clickhouse-c headers.
+//! Slice lengths are bounded by owning C values.
 //!
 //! Decoding does not automatically validate relationships between nested
 //! columns. Call [`Block::validate`] before using offsets or dictionary keys
@@ -36,11 +35,6 @@
 
 // Keep C function signatures visible in FFI wrappers
 #![allow(clippy::too_many_arguments)]
-
-/// Bundled [clickhouse-c] revision from `clickhouse-c/UPSTREAM`.
-///
-/// [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
-pub const UPSTREAM_REVISION: &str = env!("CHC_UPSTREAM_REVISION");
 
 pub mod sys;
 
@@ -66,9 +60,7 @@ pub use alloc::Allocator;
 pub use async_client::{AsyncClient, AsyncTransport, BoxedAsyncClient};
 pub use block::{Block, BlockOpts, BlockReader, Column, ColumnLayout, LowCardinalityView};
 pub use builder::{BlockBuilder, ColumnBuilder, PreparedBlock};
-pub use client::{
-    Client, ClientOpts, Event, Exception, PacketKind, ProfileInfo, Progress, ServerInfo,
-};
+pub use client::{Client, ClientOpts, Event, Exception, ProfileInfo, Progress, ServerInfo};
 pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};
 pub use io::{CancelToken, Io, PosixIo, SliceIo};

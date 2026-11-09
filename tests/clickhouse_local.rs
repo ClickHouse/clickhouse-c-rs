@@ -110,8 +110,7 @@ fn write_then_read_back_tuple() {
 
     // Tuple borrows pointer storage and child nodes until write
     let children = [a_col, b_col];
-    let mut ptrs = [std::ptr::null_mut(); 2];
-    let tuple = ColumnBuilder::tuple(&children, &mut ptrs).expect("tuple");
+    let tuple = ColumnBuilder::tuple(&children).expect("tuple");
 
     let mut io = PosixIo::new(stdin.as_fd());
     let mut bb = BlockBuilder::new();
@@ -265,8 +264,7 @@ fn write_then_read_back_nested() {
     let entry_offsets = [2u64, 3];
 
     let children = [a_col, b_col];
-    let mut ptrs = [std::ptr::null_mut(); 2];
-    let entries = ColumnBuilder::tuple(&children, &mut ptrs).expect("entry tuple");
+    let entries = ColumnBuilder::tuple(&children).expect("entry tuple");
     let nested = entries.array(&entry_offsets, 2).expect("nested");
 
     let mut io = PosixIo::new(stdin.as_fd());

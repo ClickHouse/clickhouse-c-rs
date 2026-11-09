@@ -14,6 +14,7 @@ use crate::builder::{BlockBuilder, PreparedBlock};
 use crate::client::{ClientOpts, Event, ServerInfo, take_handshake_exception};
 use crate::codec::Codec;
 use crate::error::{Result, check};
+use crate::query::{QueryOpts, RawQueryOpts};
 use crate::sys;
 
 /// Result of a protocol operation that may require more input.
@@ -41,7 +42,7 @@ impl<T> Step<T> {
 /// Native protocol client without transport I/O.
 ///
 /// ```no_run
-/// use clickhouse_c::{Allocator, ClientOpts, Event, IolessClient, Step};
+/// use clickhouse_c::{Allocator, ClientOpts, Event, IolessClient, QueryOpts, Step};
 /// use std::io::{Read, Write};
 /// use std::net::TcpStream;
 ///
@@ -64,7 +65,7 @@ impl<T> Step<T> {
 ///     pump(&mut core, &mut sock)?;
 /// }
 ///
-/// core.send_query("SELECT 1", None)?;
+/// core.send_query("SELECT 1", &QueryOpts::new())?;
 /// loop {
 ///     match core.recv_event()? {
 ///         Step::Ready(Event::EndOfStream) => break,
@@ -159,32 +160,26 @@ impl IolessClient {
         step(rc, &err).map(|s| s.map_ready(|()| ()))
     }
 
-    /// Queues a query.
-    ///
-    /// I/O-independent C API does not support query settings or parameters.
-    pub fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
-        let (qid, qid_len) = query_id
-            .map(|q| (q.as_ptr().cast::<c_char>(), q.len()))
-            .unwrap_or((core::ptr::null(), 0));
+    /// Queues a query, see [`Client::send_query`](crate::Client::send_query).
+    pub fn send_query(&mut self, sql: &str, opts: &QueryOpts<'_>) -> Result<()> {
+        let raw_opts = RawQueryOpts::new(opts)?;
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
-            sys::chc_async_send_query(
+            sys::chc_async_send_query_ex(
                 self.raw.as_ptr(),
                 sql.as_ptr().cast::<c_char>(),
                 sql.len(),
-                qid,
-                qid_len,
+                raw_opts.as_ptr(),
                 &mut err,
             )
         };
         check(rc, &err)
     }
 
-    /// Queues a Data block, or empty terminator when `builder` is `None`.
-    pub fn send_data(&mut self, builder: Option<&BlockBuilder<'_>>) -> Result<()> {
-        let bb_ptr = builder.map(|b| b.as_ptr()).unwrap_or(core::ptr::null());
+    /// Queues a Data block.
+    pub fn send_data(&mut self, builder: &BlockBuilder<'_>) -> Result<()> {
         let mut err = sys::chc_err::zeroed();
-        let rc = unsafe { sys::chc_async_send_data(self.raw.as_ptr(), bb_ptr, &mut err) };
+        let rc = unsafe { sys::chc_async_send_data(self.raw.as_ptr(), builder.as_ptr(), &mut err) };
         check(rc, &err)
     }
 

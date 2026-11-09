@@ -51,8 +51,8 @@ fn collect_strings(client: &mut Client<'_>) -> TestResult<Vec<String>> {
 
 fn select_strings(server: &ChServer, sql: &str, opts: &QueryOpts<'_>) -> TestResult<Vec<String>> {
     let mut client = connect(server)?;
-    client.send_query_with(sql, opts)?;
-    client.send_data(None)?;
+    client.send_query(sql, opts)?;
+    client.send_data_end()?;
     collect_strings(&mut client)
 }
 

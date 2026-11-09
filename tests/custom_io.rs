@@ -215,8 +215,7 @@ fn decoded_column_splices_beside_a_local_column() {
     let val_leaf = ColumnBuilder::string(&val_offsets, val_data, 3).expect("val leaf");
     let vals = val_leaf.nullable(&val_nulls).expect("vals");
     let children = [keys, vals];
-    let mut ptrs = [core::ptr::null_mut(); 2];
-    let tuple = ColumnBuilder::tuple(&children, &mut ptrs).expect("tuple");
+    let tuple = ColumnBuilder::tuple(&children).expect("tuple");
     let map = tuple.array(&entry_offsets, 2).expect("map");
 
     let mut source = BlockBuilder::new();
@@ -323,8 +322,7 @@ fn all_layouts(io: Pin<&mut MemIo>) {
         ColumnBuilder::fixed(&nums, 4, 2).expect("tuple fixed"),
         ColumnBuilder::string(&empty_offsets, &[], 2).expect("tuple string"),
     ];
-    let mut ptrs = [core::ptr::null_mut(); 2];
-    let tuple = ColumnBuilder::tuple(&children, &mut ptrs).expect("tuple");
+    let tuple = ColumnBuilder::tuple(&children).expect("tuple");
 
     let mut builder = BlockBuilder::new();
     builder.append("f", fixed_ty.view(), &fixed).expect("f");
@@ -407,7 +405,7 @@ fn file_framing_leaves_block_info_unset() {
     let block = reader.read().expect("read").expect("one block");
 
     assert!(!block.is_overflows());
-    assert_eq!(block.bucket_num(), 0);
+    assert_eq!(block.bucket_num(), None);
 }
 
 #[test]
