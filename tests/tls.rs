@@ -290,6 +290,40 @@ fn a_plaintext_peer_fails_the_tls_handshake() -> TestResult {
     Ok(())
 }
 
+/// rustls refuses a fragment size outside 32..=16389 before any bytes move.
+#[tokio::test(flavor = "current_thread")]
+async fn an_invalid_client_config_is_an_io_error() -> TestResult {
+    // Kernel completes TCP connect from backlog, so no accept needed
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let mut config = (*tls::default_config()).clone();
+    config.max_fragment_size = Some(1);
+    let config = Arc::new(config);
+
+    let tcp = TcpStream::connect(("127.0.0.1", port))?;
+    let Err(err) = tls::TlsIo::connect(tcp, "localhost", config.clone()) else {
+        panic!("blocking client accepted a bad fragment size");
+    };
+    assert_eq!(err.kind, ErrorKind::Io);
+    assert!(err.message.contains("rustls client"), "{err}");
+
+    let Err(err) = AsyncClient::connect_tls(
+        ("127.0.0.1", port),
+        "localhost",
+        &ClientOpts::new(),
+        Allocator::stdlib(),
+        None,
+        config,
+    )
+    .await
+    else {
+        panic!("async client accepted a bad fragment size");
+    };
+    assert_eq!(err.kind, ErrorKind::Io);
+    assert!(err.message.contains("TLS handshake"), "{err}");
+    Ok(())
+}
+
 /// A deadline reaches the socket under the TLS stream, so an idle server
 /// surfaces as a read error from the callback rather than a hang.
 #[test]

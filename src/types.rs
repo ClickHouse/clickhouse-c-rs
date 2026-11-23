@@ -386,13 +386,9 @@ impl<'a> TypeRef<'a> {
 
     /// Formats type as a ClickHouse type name.
     pub fn format(&self) -> String {
-        let needed = unsafe { sys::chc_type_format(self.raw, core::ptr::null_mut(), 0) };
-        // C writes a trailing NUL past `needed` bytes
-        let mut buf = vec![0u8; needed.saturating_add(1)];
-        let _ =
-            unsafe { sys::chc_type_format(self.raw, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
-        buf.truncate(needed);
-        String::from_utf8_lossy(&buf).into_owned()
+        self.name()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .unwrap_or_default()
     }
 }
 
