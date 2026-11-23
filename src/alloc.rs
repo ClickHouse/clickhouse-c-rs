@@ -320,16 +320,25 @@ mod tests {
         assert!(!checked.is_clean());
     }
 
+    // Large enough to fail, small enough to stay a valid layout
+    const UNSERVABLE: usize = isize::MAX as usize / 2;
+
     // Failed growth must leave the original block registered
     #[test]
     fn failed_growth_keeps_the_original_block() {
         let checked = CheckedAlloc::leaked();
         let layout = Layout::from_size_align(16, 16).expect("layout");
         let p = unsafe { checked.alloc(layout) };
-        // Large enough to fail, small enough to stay a valid layout
-        let unservable = isize::MAX as usize / 2;
-        assert!(unsafe { checked.realloc(p, layout, unservable) }.is_null());
+        assert!(unsafe { checked.realloc(p, layout, UNSERVABLE) }.is_null());
         unsafe { checked.dealloc(p, layout) };
+        assert!(checked.is_clean());
+    }
+
+    #[test]
+    fn failed_allocation_registers_nothing() {
+        let checked = CheckedAlloc::leaked();
+        let layout = Layout::from_size_align(UNSERVABLE, 16).expect("layout");
+        assert!(unsafe { checked.alloc(layout) }.is_null());
         assert!(checked.is_clean());
     }
 

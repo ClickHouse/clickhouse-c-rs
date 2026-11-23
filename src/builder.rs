@@ -513,8 +513,10 @@ mod tests {
             (4, 1u32.to_ne_bytes().to_vec()),
             (8, 1u64.to_ne_bytes().to_vec()),
         ] {
-            dict.low_cardinality(key_size, &keys, 1)
-                .unwrap_or_else(|e| panic!("key size {key_size}: {e}"));
+            assert!(
+                dict.low_cardinality(key_size, &keys, 1).is_ok(),
+                "key size {key_size}",
+            );
         }
     }
 
